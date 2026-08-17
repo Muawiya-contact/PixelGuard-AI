@@ -109,7 +109,7 @@ def health():
             client_ok = True
             detail = f"Client ready in {KEY_MODE} mode"
         except Exception as exc:  # pragma: no cover
-            detail = f"Client initialization failed: {exc}"
+            detail = redact(f"Client initialization failed: {exc}")
     return {
         "status": "ok" if (api_key_present and client_ok) else "degraded",
         "api_key_present": api_key_present,
@@ -139,6 +139,23 @@ def _extract_json(text: str) -> dict:
             except json.JSONDecodeError:
                 pass
     return {"verdict": "inconclusive", "raw_response": text}
+
+
+def redact(text: str) -> str:
+    """Strip anything key-shaped from text before it reaches a client or a log.
+
+    Upstream SDK errors are relayed to unauthenticated callers, so never trust
+    that a third-party exception message is free of credentials.
+    """
+    out = str(text)
+    if API_KEY:
+        out = out.replace(API_KEY, "***REDACTED***")
+    # Catch key-shaped strings generally: Google API keys, Vertex express keys,
+    # and any `key=`/`api_key=` query parameter that slips into an error URL.
+    out = re.sub(r"AIza[0-9A-Za-z_\-]{10,}", "***REDACTED***", out)
+    out = re.sub(r"AQ\.[0-9A-Za-z_\-]{10,}", "***REDACTED***", out)
+    out = re.sub(r"((?:api_)?key=)[^&\s\"']{8,}", r"\1***REDACTED***", out, flags=re.IGNORECASE)
+    return out
 
 
 def _is_model_unavailable(exc: Exception) -> bool:
@@ -207,7 +224,7 @@ async def analyze_image(
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini analysis failed: {exc}")
+        raise HTTPException(status_code=502, detail=redact(f"Gemini analysis failed: {exc}"))
 
     return {
         "filename": file.filename,

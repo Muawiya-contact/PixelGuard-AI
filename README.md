@@ -1,5 +1,8 @@
 # PixelGuard-AI
 
+[![CI](https://github.com/Muawiya-contact/PixelGuard-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/Muawiya-contact/PixelGuard-AI/actions/workflows/ci.yml)
+[![Deploy](https://github.com/Muawiya-contact/PixelGuard-AI/actions/workflows/deploy.yml/badge.svg)](https://github.com/Muawiya-contact/PixelGuard-AI/actions/workflows/deploy.yml)
+
 Enterprise Generative Media Provenance &amp; Forensics Suite. Detects tampering and tracks AI asset origin using robust, imperceptible frequency-domain watermarking and signed C2PA manifests.
 
 Tags: python, fastapi, pytorch, opencv, gemini-api, c2pa, provenance, ai-security, media-forensics, generative-ai
@@ -122,6 +125,40 @@ That message means the browser's request never completed — usually CORS, not d
    ```
    A working response is `HTTP 200` **with** an `access-control-allow-origin` header. A `400` with no such header means the origin is rejected — fix it via the CORS options above.
 3. **Is the frontend pointed at the right backend?** `VITE_API_BASE_URL` must be set in Vercel with no trailing slash. It is baked in at build time, so redeploy after changing it.
+
+## Security: handling the Gemini API key
+
+The key is a server-side secret. It is read from the environment at startup and **never** reaches the browser — the frontend only ever talks to your backend.
+
+**Where the key belongs**
+
+| Environment | Location | Notes |
+| --- | --- | --- |
+| Local | `backend/.env` | gitignored; only `.env.example` (placeholder) is committed |
+| Render | Dashboard → Environment | declared `sync: false` in `render.yaml`, so no value lives in git |
+| Vercel | *nowhere* | the frontend never sees the key |
+
+**Never** give the key a `VITE_` prefix. Vite inlines every `VITE_*` variable into the JavaScript bundle it ships to browsers, which would publish the key to anyone who opens devtools.
+
+**Built-in protections**
+
+- `backend/.dockerignore` keeps `.env` out of container images.
+- `/api/v1/health` reports only whether a key is present (a boolean), never its value.
+- All upstream error text passes through `redact()` before reaching a client or a log, so a Gemini SDK exception cannot relay credentials even if a future version includes them in a message.
+- CI fails the build if any endpoint echoes key-shaped data.
+
+**If a key is ever exposed,** revoke it first at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) (or the Google Cloud console) and then issue a new one. Rotation is the only real fix — scrubbing it from git history does not help once it has been pushed.
+
+### Known exposure: the analyze endpoint is public
+
+`POST /api/v1/forensics/analyze` requires no authentication, so anyone who discovers your Render URL can submit images and **spend your Gemini quota**. The key itself stays safe; the billing does not. This is a reasonable trade for a public demo, but before leaving it up long-term consider:
+
+- setting a spending cap or quota limit on the Google Cloud project,
+- restricting the API key to the Generative Language API in the Google Cloud console,
+- requiring a shared token on the endpoint (note: any token the browser holds is itself public — real protection needs a login),
+- or adding per-IP rate limiting.
+
+Disabling the public API explorer also lowers discoverability: pass `docs_url=None, redoc_url=None` to `FastAPI(...)` in production.
 
 ## Environment Variables
 
