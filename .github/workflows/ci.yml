@@ -76,6 +76,53 @@ jobs:
           print("Backend endpoint checks passed")
           PY
 
+      - name: Verify secrets are never echoed to clients
+        working-directory: backend
+        env:
+          GOOGLE_API_KEY: AQ.CANARY_ci_only_not_a_real_key_1234567890
+        run: |
+          python - <<'PY'
+          import os
+          from fastapi.testclient import TestClient
+          import main
+
+          canary = os.environ["GOOGLE_API_KEY"]
+          main.API_KEY = canary
+          main._client = None
+
+          # redact() must strip the configured key and anything key-shaped.
+          for probe in (
+              f"boom {canary} boom",
+              "https://x.googleapis.com/v1?key=AIzaFAKE_FIXTURE_NOT_A_REAL_KEY_0000",
+              "auth failed for AQ.FAKE_FIXTURE_NOT_A_REAL_KEY_0000",
+              "https://api.example/v1?api_key=FAKE_FIXTURE_NOT_A_REAL_TOKEN",
+          ):
+              out = main.redact(probe)
+              assert canary not in out, f"configured key survived redact(): {out}"
+              assert "***REDACTED***" in out, f"nothing redacted in: {out}"
+          assert main.redact("plain text") == "plain text", "redact() mangled benign text"
+
+          # A real upstream failure must not relay credentials to the caller.
+          client = TestClient(main.app)
+          png = bytes.fromhex(
+              "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+              "890000000a49444154789c6300010000050001" "0d0a2db4" "0000000049454e44ae426082"
+          )
+          r = client.post(
+              "/api/v1/forensics/analyze", files={"file": ("t.png", png, "image/png")}
+          )
+          assert canary not in r.text, f"KEY LEAKED in {r.status_code} response: {r.text[:300]}"
+          assert "AQ." not in r.text, f"key-shaped string leaked: {r.text[:300]}"
+          print(f"analyze -> {r.status_code}, no credentials in body")
+
+          for path in ("/", "/api/v1/health", "/openapi.json"):
+              body = client.get(path).text
+              assert canary not in body, f"key leaked via {path}"
+              print(f"{path} -> clean")
+
+          print("Secret-leakage checks passed")
+          PY
+
       - name: Verify CORS allows Vercel origins
         working-directory: backend
         run: |
