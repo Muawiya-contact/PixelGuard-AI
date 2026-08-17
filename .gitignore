@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment — ignore real env files, keep the examples
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Build outputs
+frontend/dist/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
