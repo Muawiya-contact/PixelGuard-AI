@@ -45,16 +45,24 @@ app = FastAPI(
     version="0.2.0",
 )
 
-# Local dev origins always allowed; production origins come from CORS_ORIGINS
-# (comma-separated, e.g. "https://pixelguard.vercel.app,https://pixelguard-git-main-you.vercel.app").
-# Set CORS_ORIGINS=* to allow everything (local testing only).
+# CORS. Local dev origins are always allowed. Production origins come from
+# CORS_ORIGINS (comma-separated); CORS_ORIGINS=* allows everything.
+# Vercel deployments — production plus every preview/branch URL — are matched by
+# CORS_ORIGIN_REGEX so a new preview deploy never needs a backend env change.
 _default_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 _extra_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-CORS_ORIGINS = ["*"] if "*" in _extra_origins else _default_origins + _extra_origins
+ALLOW_ALL_ORIGINS = "*" in _extra_origins
+CORS_ORIGINS = ["*"] if ALLOW_ALL_ORIGINS else _default_origins + _extra_origins
+
+# Matched with re.fullmatch, so it cannot be spoofed by a suffix/query trick.
+CORS_ORIGIN_REGEX = None if ALLOW_ALL_ORIGINS else os.getenv(
+    "CORS_ORIGIN_REGEX", r"https://[a-z0-9-]+\.vercel\.app"
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -109,6 +117,7 @@ def health():
         "model": PREFERRED_MODEL,
         "fallback_models": FALLBACK_MODELS,
         "model_configured": client_ok,
+        "cors": {"allow_origins": CORS_ORIGINS, "allow_origin_regex": CORS_ORIGIN_REGEX},
         "detail": detail,
     }
 
