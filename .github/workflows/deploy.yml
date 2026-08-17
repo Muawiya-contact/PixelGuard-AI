@@ -1,0 +1,110 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # allows a manual re-trigger from the Actions tab
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false # never interrupt an in-flight deploy
+
+permissions:
+  contents: read
+
+jobs:
+  notify-deploys:
+    name: Announce deployment targets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # need the previous commit to diff changed paths
+
+      - name: Detect which app changed
+        id: changes
+        run: |
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            changed=$(git diff --name-only HEAD^ HEAD)
+          else
+            changed=$(git ls-files)
+          fi
+          backend=false
+          frontend=false
+          echo "$changed" | grep -q '^backend/'  && backend=true
+          echo "$changed" | grep -q '^frontend/' && frontend=true
+          echo "backend=$backend"   >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+          echo "Changed paths in ${GITHUB_SHA:0:7}:"
+          echo "$changed" | sed 's/^/  /'
+
+      - name: Deployment summary
+        env:
+          BACKEND_CHANGED: ${{ steps.changes.outputs.backend }}
+          FRONTEND_CHANGED: ${{ steps.changes.outputs.frontend }}
+        run: |
+          {
+            echo "## PixelGuard deployment triggered"
+            echo ""
+            echo "Commit \`${GITHUB_SHA:0:7}\` pushed to \`main\`."
+            echo ""
+            echo "| Target | Platform | Path | Changed | Deploys via |"
+            echo "| --- | --- | --- | --- | --- |"
+            echo "| Backend | Render (Docker) | \`backend/\` | $BACKEND_CHANGED | Git hook, autoDeploy |"
+            echo "| Frontend | Vercel (Vite SPA) | \`frontend/\` | $FRONTEND_CHANGED | Git integration |"
+            echo ""
+            echo "Render and Vercel watch this repository directly, so both redeploy"
+            echo "on their own. This job records what shipped; it does not gate them."
+            echo ""
+            echo "Verify once the platforms finish:"
+            echo ""
+            echo '```bash'
+            echo "curl -s https://pixelguard-ai.onrender.com/api/v1/health"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Backend changed:  $BACKEND_CHANGED  -> Render redeploys backend/"
+          echo "Frontend changed: $FRONTEND_CHANGED -> Vercel redeploys frontend/"
+          echo "Both platforms deploy from their own Git integrations; nothing to push here."
+
+      # Optional: only needed if you turn OFF Render's autoDeploy and would
+      # rather have CI drive the deploy. Create the hook under
+      # Render -> Service -> Settings -> Deploy Hook, then save the URL as the
+      # repository secret RENDER_DEPLOY_HOOK_URL. Skipped when unset.
+      - name: Trigger Render deploy hook (optional)
+        if: ${{ steps.changes.outputs.backend == 'true' }}
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL not set — skipping; Render autoDeploy already covers this."
+            exit 0
+          fi
+          echo "Triggering Render deploy hook…"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$RENDER_DEPLOY_HOOK_URL")
+          echo "Render responded with HTTP $status"
+          case "$status" in
+            2*) echo "Deploy hook accepted." ;;
+            *)  echo "Deploy hook failed."; exit 1 ;;
+          esac
+
+      # Optional: Vercel's Git integration already covers this. Use a Deploy
+      # Hook (Vercel -> Project -> Settings -> Git -> Deploy Hooks) only if you
+      # disable it. Save the URL as the secret VERCEL_DEPLOY_HOOK_URL.
+      - name: Trigger Vercel deploy hook (optional)
+        if: ${{ steps.changes.outputs.frontend == 'true' }}
+        env:
+          VERCEL_DEPLOY_HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$VERCEL_DEPLOY_HOOK_URL" ]; then
+            echo "VERCEL_DEPLOY_HOOK_URL not set — skipping; Vercel's Git integration already covers this."
+            exit 0
+          fi
+          echo "Triggering Vercel deploy hook…"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$VERCEL_DEPLOY_HOOK_URL")
+          echo "Vercel responded with HTTP $status"
+          case "$status" in
+            2*) echo "Deploy hook accepted." ;;
+            *)  echo "Deploy hook failed."; exit 1 ;;
+          esac

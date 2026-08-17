@@ -13,11 +13,13 @@ venv/
 
 # Build outputs
 frontend/dist/
+frontend/.vite/
 *.egg-info/
 
 # Editor / OS
 .vscode/
 .idea/
+.claude/
 .DS_Store
 
 # Logs
