@@ -14,5 +14,8 @@ services:
     envVars:
       - key: PAID_GEMINI_API_KEY
         sync: false # secret — set the value in the Render dashboard, never in git
+      # Vercel origins (production + previews) are allowed by default via
+      # CORS_ORIGIN_REGEX, so CORS_ORIGINS is only needed for other hosts.
+      # Set it to "*" to allow every origin during demos/hackathon evaluation.
       - key: CORS_ORIGINS
-        value: https://your-frontend.vercel.app # replace with your real Vercel domain(s), comma-separated
+        sync: false

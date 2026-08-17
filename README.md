@@ -95,11 +95,33 @@ Every push to `main` now redeploys the backend automatically.
 
 `frontend/vercel.json` rewrites all routes to `index.html` (SPA routing). Every push to `main` redeploys; PRs get preview URLs.
 
-### Step 3 — Close the CORS loop
+### Step 3 — CORS
 
-1. Back in Render, set `CORS_ORIGINS` to your Vercel domain(s), comma-separated:
-   `https://pixelguard.vercel.app` (add preview domains if you want them to reach the API).
-2. Render redeploys automatically on the env change. Open your Vercel URL, upload an image, and **Run Forensics** — the full pipeline should work end to end.
+**Vercel needs no extra configuration.** The backend allows any `*.vercel.app` origin by default — production, branch, and per-deploy preview URLs alike — so new previews work without touching backend env vars.
+
+Only adjust CORS if:
+
+- **Your frontend is not on Vercel** (Netlify, custom domain): set `CORS_ORIGINS` on Render to your origin(s), comma-separated.
+- **You want to narrow the default:** set `CORS_ORIGIN_REGEX`, e.g. `https://pixelguard-ai[a-z0-9-]*\.vercel\.app`.
+- **You need a wide-open API for a demo or hackathon judging:** set `CORS_ORIGINS=*`. Note this lets anyone who knows the URL spend your Gemini quota, so revert it afterwards.
+
+Render redeploys automatically on an env change. To confirm what's live, `GET /api/v1/health` reports the effective CORS config:
+
+```bash
+curl -s https://your-backend.onrender.com/api/v1/health
+```
+
+### Troubleshooting: "Could not reach the backend"
+
+That message means the browser's request never completed — usually CORS, not downtime. Check in this order:
+
+1. **Is the backend up?** `curl https://your-backend.onrender.com/api/v1/health` → expect `"status": "ok"`. On the free tier the first call after ~15 min idle can take up to a minute.
+2. **Is the preflight passing?** Substitute your real frontend origin:
+   ```bash
+   curl -i -X OPTIONS https://your-backend.onrender.com/api/v1/forensics/analyze -H "Origin: https://your-app.vercel.app" -H "Access-Control-Request-Method: POST"
+   ```
+   A working response is `HTTP 200` **with** an `access-control-allow-origin` header. A `400` with no such header means the origin is rejected — fix it via the CORS options above.
+3. **Is the frontend pointed at the right backend?** `VITE_API_BASE_URL` must be set in Vercel with no trailing slash. It is baked in at build time, so redeploy after changing it.
 
 ## Environment Variables
 
@@ -109,5 +131,6 @@ Every push to `main` now redeploys the backend automatically.
 | `PAID_GEMINI_API_KEY` | backend | Alternative name for the key, e.g. paid `AQ.…` keys |
 | `GEMINI_MODEL` | backend | Optional model override (default `gemini-pro-latest`, auto-fallback) |
 | `GEMINI_KEY_MODE` | backend | `developer` (default) or `vertex` for Vertex AI express keys |
-| `CORS_ORIGINS` | backend | Comma-separated production frontend origins (localhost is always allowed) |
+| `CORS_ORIGINS` | backend | Extra allowed origins, comma-separated; `*` allows all (localhost always allowed) |
+| `CORS_ORIGIN_REGEX` | backend | Origin pattern, default `https://[a-z0-9-]+\.vercel\.app` (covers preview deploys) |
 | `VITE_API_BASE_URL` | frontend | Backend base URL (defaults to `http://localhost:8000`) |
