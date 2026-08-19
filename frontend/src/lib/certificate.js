@@ -11,6 +11,51 @@
  * analysis supports would be worse than no certificate at all.
  */
 
+/**
+ * Load an image and re-encode it as a bounded JPEG data URI.
+ *
+ * jsPDF needs raw image data, and an object URL is not that. These renders are
+ * a visual reference so a reader can see what was examined — the SHA-256 in the
+ * evidence table is the authoritative identifier, not these pixels — so JPEG at
+ * a capped edge is the right trade: a PNG of the same photo pushed a typical
+ * certificate past 1.2 MB, which is unusable as an email attachment.
+ */
+function toBoundedImage(src, maxEdge = 520, quality = 0.82) {
+  return new Promise((resolve) => {
+    if (!src) {
+      resolve(null)
+      return
+    }
+    if (typeof document === 'undefined' || typeof Image === 'undefined') {
+      resolve(null) // no DOM (SSR, tests) — the certificate is still valid without art
+      return
+    }
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight))
+        const w = Math.max(1, Math.round(img.naturalWidth * scale))
+        const h = Math.max(1, Math.round(img.naturalHeight * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        // JPEG has no alpha; paint white first so transparent PNGs do not
+        // flatten onto black.
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, w, h)
+        ctx.drawImage(img, 0, 0, w, h)
+        resolve({ dataUrl: canvas.toDataURL('image/jpeg', quality), width: w, height: h })
+      } catch {
+        resolve(null) // tainted canvas or no 2d context — the PDF is still valid without art
+      }
+    }
+    img.onerror = () => resolve(null)
+    img.src = src
+  })
+}
+
 const INK = { heading: [226, 232, 240], body: [51, 65, 85], muted: [100, 116, 139], rule: [203, 213, 225] }
 const ACCENT = [8, 145, 178]
 
@@ -28,6 +73,15 @@ const VERDICT_COLOR = {
   inconclusive: [176, 120, 20],
 }
 
+function fmtStamp(date) {
+  // A certificate is read by people: "19 Aug 2026, 19:39:09 UTC" beats an ISO
+  // string. The exact ISO form still appears in the footer for machine use.
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const p = (n) => String(n).padStart(2, '0')
+  return `${date.getUTCDate()} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}, ` +
+    `${p(date.getUTCHours())}:${p(date.getUTCMinutes())}:${p(date.getUTCSeconds())} UTC`
+}
+
 function fmtBytes(n) {
   if (!Number.isFinite(n)) return '—'
   if (n < 1024) return `${n} B`
@@ -35,7 +89,7 @@ function fmtBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
-export async function buildCertificate(result) {
+export async function buildCertificate(result, originalSrc = null) {
   if (!result) throw new Error('No analysis result to certify.')
 
   const { jsPDF } = await import('jspdf')
@@ -57,12 +111,15 @@ export async function buildCertificate(result) {
   doc.setTextColor(...INK.heading)
   doc.setFont('helvetica', 'bold').setFontSize(20)
   doc.text('PixelGuard', M, 44)
+  // Measure rather than assume: a hardcoded offset collides the moment the
+  // font metrics differ from whatever was eyeballed.
+  const brandWidth = doc.getTextWidth('PixelGuard')
   doc.setTextColor(...ACCENT)
-  doc.text('Forensic Certificate', M + 92, 44)
+  doc.text('Forensic Certificate', M + brandWidth + 12, 44)
   doc.setFont('helvetica', 'normal').setFontSize(9)
   doc.setTextColor(148, 163, 184)
   doc.text('AI Asset Provenance & Forensics Engine', M, 62)
-  doc.text(`Issued ${issued.toISOString()}`, M, 76)
+  doc.text(`Issued ${fmtStamp(issued)}`, M, 76)
   y = 128
 
   // --- verdict + score ---------------------------------------------------
@@ -81,10 +138,34 @@ export async function buildCertificate(result) {
   // --- evidence table ----------------------------------------------------
   const meta = result.metadata || {}
   const ela = result.ela || null
+  const fp = result.fingerprint || {}
+  const aspect = fp.aspect || {}
+  const colour = fp.colour || {}
   const rows = [
     ['File', result.filename || '—'],
+    ['SHA-256', fp.sha256 || 'not computed'],
     ['Type / size', `${result.content_type || '—'} · ${fmtBytes(result.size_bytes)}`],
-    ['Dimensions', result.dimensions ? `${result.dimensions.width} x ${result.dimensions.height} px` : '—'],
+    [
+      'Dimensions',
+      result.dimensions
+        ? `${result.dimensions.width} x ${result.dimensions.height} px${fp.megapixels ? ` · ${fp.megapixels} MP` : ''}`
+        : '—',
+    ],
+    [
+      'Aspect ratio',
+      aspect.simplified
+        ? `${aspect.simplified}${aspect.name ? ` (${aspect.name})` : ''} · ${aspect.orientation}`
+        : '—',
+    ],
+    [
+      'Colour balance',
+      colour.mean_rgb
+        ? `mean RGB ${colour.mean_rgb.r} / ${colour.mean_rgb.g} / ${colour.mean_rgb.b}` +
+          (colour.channel_balance
+            ? `  ·  R ${(colour.channel_balance.r * 100).toFixed(1)}% G ${(colour.channel_balance.g * 100).toFixed(1)}% B ${(colour.channel_balance.b * 100).toFixed(1)}%`
+            : '')
+        : '—',
+    ],
     ['Analysis model', result.model || '—'],
     ['Metadata verdict', `${meta.verdict || '—'}${meta.confidence ? ` (confidence: ${meta.confidence})` : ''}`],
     ['C2PA manifest', meta.c2pa?.present ? 'Present — NOT cryptographically validated' : 'None found'],
@@ -113,7 +194,9 @@ export async function buildCertificate(result) {
   y += 20
 
   const section = (title) => {
-    if (y > H - 130) {
+    // Only needs room for the heading plus a line or two; bullets() re-checks
+    // per item, so a tighter bound here just avoids stranding a third of a page.
+    if (y > H - 96) {
       doc.addPage()
       y = M + 8
     }
@@ -121,6 +204,17 @@ export async function buildCertificate(result) {
     doc.text(title, M, y)
     y += 15
     doc.setFont('helvetica', 'normal').setFontSize(9.5)
+  }
+
+  // Hanging indent: the bullet sits in its own gutter and wrapped lines align
+  // under the text, not back at the margin.
+  const BULLET_GUTTER = 12
+
+  const bullet = (text, left, width, lineHeight = 12) => {
+    const lines = doc.splitTextToSize(String(text), width - BULLET_GUTTER)
+    doc.text('\u2022', left, y)
+    doc.text(lines, left + BULLET_GUTTER, y)
+    y += lines.length * lineHeight + 4
   }
 
   const bullets = (items, empty) => {
@@ -136,11 +230,68 @@ export async function buildCertificate(result) {
         doc.addPage()
         y = M + 8
       }
-      const lines = doc.splitTextToSize(`•  ${item}`, W - 2 * M - 10)
-      doc.text(lines, M + 8, y)
-      y += lines.length * 12 + 3
+      bullet(item, M + 8, W - 2 * M - 8)
     }
     y += 6
+  }
+
+  // Dominant colour swatches: a compact visual the eye can match against the image.
+  if (colour.dominant?.length) {
+    section('Dominant colours by area')
+    const sw = 54
+    const gap = 10
+    let x = M
+    doc.setFontSize(7.5)
+    for (const c of colour.dominant.slice(0, 5)) {
+      const [r, g, b] = c.rgb || [0, 0, 0]
+      doc.setFillColor(r, g, b)
+      doc.setDrawColor(...INK.rule)
+      doc.roundedRect(x, y, sw, 26, 3, 3, 'FD')
+      doc.setTextColor(...INK.muted)
+      doc.text(c.hex, x, y + 36)
+      doc.text(`${(c.share * 100).toFixed(1)}%`, x, y + 45)
+      x += sw + gap
+    }
+    y += 72 // clear of the swatch captions before the next section heading
+  }
+
+  // Embedded renders. Generous padding below the images keeps their captions
+  // clear of whatever section lands next.
+  const [origImg, elaImg] = await Promise.all([
+    toBoundedImage(originalSrc),
+    toBoundedImage(ela?.heatmap),
+  ])
+  if (origImg || elaImg) {
+    if (y > H - 260) {
+      doc.addPage()
+      y = M + 8
+    }
+    section('Visual record')
+    const slot = (W - 2 * M - 20) / 2
+    const boxH = 150
+    const drawImage = (img, left, caption) => {
+      doc.setDrawColor(...INK.rule)
+      doc.setFillColor(248, 250, 252)
+      doc.roundedRect(left, y, slot, boxH, 4, 4, 'FD')
+      if (img) {
+        const pad = 10
+        const scale = Math.min((slot - pad * 2) / img.width, (boxH - pad * 2) / img.height)
+        const w = img.width * scale
+        const h = img.height * scale
+        doc.addImage(img.dataUrl, 'JPEG', left + (slot - w) / 2, y + (boxH - h) / 2, w, h)
+      }
+      doc.setFontSize(8).setTextColor(...INK.muted)
+      doc.text(caption, left + slot / 2, y + boxH + 13, { align: 'center' })
+    }
+    drawImage(origImg, M, 'Original')
+    drawImage(elaImg, M + slot + 20, 'ELA heatmap')
+    y += boxH + 26
+    doc.setFontSize(7.5).setTextColor(...INK.muted)
+    doc.text(
+      'Downscaled visual references. The SHA-256 above identifies the analysed bytes.',
+      M, y,
+    )
+    y += 18
   }
 
   section('Summary')
@@ -177,15 +328,21 @@ export async function buildCertificate(result) {
     'Error Level Analysis is a visual aid only. Texture and re-saving raise error without editing, and an edit re-saved at the same quality leaves no trace.',
     'The visual assessment comes from a general-purpose language model and can be confidently wrong.',
   ]
-  const wrapped = limitations.map((t) => doc.splitTextToSize(`•  ${t}`, W - 2 * M - 24))
-  const boxHeight = 26 + wrapped.reduce((n, l) => n + l.length * 11 + 4, 0)
+  const LIM_WIDTH = W - 2 * M - 24 - BULLET_GUTTER
+  // Measure at the size the text will actually be drawn at, or the box will
+  // not match its contents.
+  doc.setFont('helvetica', 'normal').setFontSize(8.5)
+  const wrapped = limitations.map((t) => doc.splitTextToSize(t, LIM_WIDTH))
+  const boxHeight = 34 + wrapped.reduce((n, l) => n + l.length * 11 + 5, 0)
+  doc.setFont('helvetica', 'bold').setFontSize(10).setTextColor(...INK.body)
   doc.roundedRect(M, boxTop, W - 2 * M, boxHeight, 5, 5, 'FD')
   doc.text('Limitations', M + 12, y + 14)
-  y += 28
+  y += 30
   doc.setFont('helvetica', 'normal').setFontSize(8.5).setTextColor(...INK.muted)
   for (const lines of wrapped) {
-    doc.text(lines, M + 12, y)
-    y += lines.length * 11 + 4
+    doc.text('\u2022', M + 12, y)
+    doc.text(lines, M + 12 + BULLET_GUTTER, y)
+    y += lines.length * 11 + 5
   }
 
   // --- footer on every page ---------------------------------------------
@@ -193,15 +350,15 @@ export async function buildCertificate(result) {
   for (let p = 1; p <= pages; p += 1) {
     doc.setPage(p)
     doc.setFont('helvetica', 'normal').setFontSize(8).setTextColor(...INK.muted)
-    doc.text(`PixelGuard forensic certificate · ${issued.toISOString()}`, M, H - 26)
+    doc.text(`PixelGuard forensic certificate · issued ${issued.toISOString()}`, M, H - 26)
     doc.text(`Page ${p} of ${pages}`, W - M, H - 26, { align: 'right' })
   }
 
   return doc
 }
 
-export async function downloadCertificate(result) {
-  const doc = await buildCertificate(result)
+export async function downloadCertificate(result, originalSrc = null) {
+  const doc = await buildCertificate(result, originalSrc)
   const base = (result.filename || 'image').replace(/\.[^.]+$/, '').replace(/[^a-z0-9_-]+/gi, '_')
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
   doc.save(`pixelguard-certificate-${base}-${stamp}.pdf`)

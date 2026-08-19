@@ -2,38 +2,88 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Light is the default and dark is opt-in via a `.dark` class on <html>, set
+ * before first paint by the inline script in index.html. Only the variables
+ * change between themes — no component needs a `dark:` variant for structure.
+ */
 @layer base {
+  :root {
+    --pg-bg: 244 246 249;
+    --pg-card: 255 255 255;
+    --pg-raised: 241 245 249;
+    --pg-line: 214 222 233;
+    --pg-fg: 15 23 42;
+    --pg-muted: 71 85 105;
+    --pg-faint: 100 116 139;   /* slate-500: 4.6:1 on white, meets AA for small text */
+    --pg-accent: 13 116 144;
+    --pg-accent-on: 255 255 255;
+    --pg-glow-1: rgba(13, 116, 144, 0.08);
+    --pg-glow-2: rgba(13, 116, 144, 0.05);
+    --pg-scrollbar: rgba(71, 85, 105, 0.28);
+    color-scheme: light;
+  }
+
+  .dark {
+    --pg-bg: 7 9 15;
+    --pg-card: 12 16 26;
+    --pg-raised: 22 28 44;
+    --pg-line: 33 44 66;
+    --pg-fg: 226 232 240;
+    --pg-muted: 148 163 184;
+    --pg-faint: 126 141 163;   /* lifted to clear 4.5:1 on the dark card */
+    --pg-accent: 34 211 238;
+    --pg-accent-on: 7 9 15;
+    --pg-glow-1: rgba(34, 211, 238, 0.08);
+    --pg-glow-2: rgba(14, 116, 144, 0.06);
+    --pg-scrollbar: rgba(148, 163, 184, 0.22);
+    color-scheme: dark;
+  }
+
+  html {
+    /* Long hashes and filenames must never widen the page. */
+    overflow-x: hidden;
+  }
+
   body {
-    @apply bg-surface-950 text-slate-200 antialiased;
+    @apply bg-bg text-fg antialiased;
     background-image:
-      radial-gradient(ellipse 80% 50% at 50% -20%, rgba(34, 211, 238, 0.08), transparent),
-      radial-gradient(ellipse 60% 40% at 90% 110%, rgba(14, 116, 144, 0.06), transparent);
+      radial-gradient(ellipse 80% 50% at 50% -20%, var(--pg-glow-1), transparent),
+      radial-gradient(ellipse 60% 40% at 90% 110%, var(--pg-glow-2), transparent);
+    background-attachment: fixed;
     min-height: 100vh;
+    overflow-x: hidden;
+    transition: background-color 200ms ease, color 200ms ease;
   }
 }
 
 @layer components {
   .panel {
-    @apply rounded-2xl border border-white/5 bg-surface-900/80 backdrop-blur-sm;
+    @apply rounded-2xl border border-line bg-card;
   }
+
+  /* Long unbroken tokens — SHA-256 digests, model ids, filenames. */
+  .break-anywhere {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
   .scanline {
-    background: linear-gradient(to bottom, transparent, rgba(34, 211, 238, 0.35), transparent);
+    background: linear-gradient(to bottom, transparent, rgb(var(--pg-accent) / 0.35), transparent);
     animation: scan 2.2s ease-in-out infinite;
   }
+
   @keyframes scan {
     0%, 100% { transform: translateY(-120px); opacity: 0.2; }
     50% { transform: translateY(120px); opacity: 1; }
   }
 }
 
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.2);
-  border-radius: 4px;
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--pg-scrollbar); border-radius: 4px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .scanline { animation: none; }
+  * { transition-duration: 0.01ms !important; }
 }

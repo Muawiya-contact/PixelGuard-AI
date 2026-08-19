@@ -13,6 +13,7 @@ from google.genai import types as genai_types
 from PIL import Image
 
 from services import ela as ela_service
+from services import fingerprint as fingerprint_service
 from services import metadata as metadata_service
 from services import prelint
 
@@ -46,7 +47,7 @@ def get_client() -> genai.Client:
 app = FastAPI(
     title="PixelGuard API",
     description="AI Asset Provenance & Forensics Engine",
-    version="0.3.0",
+    version="0.4.0",
 )
 
 # CORS. Local dev origins are always allowed. Production origins come from
@@ -255,6 +256,16 @@ async def analyze_metadata(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=redact(f"Metadata parse failed: {exc}"))
 
 
+@app.post("/api/v1/analyze/fingerprint")
+async def analyze_fingerprint(file: UploadFile = File(...)):
+    """SHA-256, geometry and colour statistics. Local only, no model call."""
+    image, raw = await _read_image(file)
+    try:
+        return {"filename": file.filename, "fingerprint": fingerprint_service.fingerprint(image, raw)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=redact(f"Fingerprint failed: {exc}"))
+
+
 @app.post("/api/v1/forensics/analyze")
 async def analyze_image(
     file: UploadFile = File(...),
@@ -279,6 +290,11 @@ async def analyze_image(
         meta = metadata_service.parse_metadata(image, raw)
     except Exception as exc:
         meta = {"verdict": "error", "rationale": redact(str(exc)), "ai_signatures": [], "editing_software": []}
+
+    try:
+        fingerprint = fingerprint_service.fingerprint(image, raw)
+    except Exception:
+        fingerprint = None  # descriptive only; never block the analysis
 
     ela_result = None
     if include_ela:
@@ -313,6 +329,7 @@ async def analyze_image(
         "model": model_used,
         "key_mode": KEY_MODE,
         "report": report,
+        "fingerprint": fingerprint,
         "metadata": meta,
         "ela": ela_result,
         "prelint": {**prelint.summarise(findings), "findings": findings},

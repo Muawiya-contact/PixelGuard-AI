@@ -47,11 +47,11 @@ export default function CompareSlider({ original, heatmap, alt = 'Comparison' })
           setDragging(true)
           setFromClientX(e.clientX)
         }}
-        className="relative select-none overflow-hidden rounded-xl border border-white/10 bg-surface-950 touch-none"
+        className="relative w-full min-w-0 select-none overflow-hidden rounded-xl border border-line bg-raised touch-none"
         style={{ cursor: dragging ? 'grabbing' : 'ew-resize' }}
       >
         {/* Base layer: the original image defines the box size. */}
-        <img src={original} alt={alt} className="block w-full select-none" draggable={false} />
+        <img src={original} alt={alt} className="block w-full max-w-full select-none" draggable={false} />
 
         {/* Overlay: heatmap, clipped to the divider. */}
         <div
@@ -67,7 +67,7 @@ export default function CompareSlider({ original, heatmap, alt = 'Comparison' })
         </div>
 
         <div className="pointer-events-none absolute inset-y-0" style={{ left: `${position}%` }}>
-          <div className="absolute inset-y-0 -translate-x-1/2 border-l-2 border-accent/90 shadow-[0_0_12px_rgba(34,211,238,0.6)]" />
+          <div className="absolute inset-y-0 -translate-x-1/2 border-l-2 border-accent shadow-[0_0_12px_rgb(var(--pg-accent)/0.55)]" />
         </div>
 
         <input
@@ -82,21 +82,21 @@ export default function CompareSlider({ original, heatmap, alt = 'Comparison' })
         />
 
         <div
-          className="pointer-events-none absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-accent/60 bg-surface-900/90 p-2 shadow-lg"
+          className="pointer-events-none absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-accent/60 bg-card p-2 shadow-lg"
           style={{ left: `${position}%` }}
         >
           <MoveHorizontal size={16} className="text-accent" />
         </div>
 
-        <span className="pointer-events-none absolute left-3 top-3 rounded-md bg-surface-950/80 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-accent">
+        <span className="pointer-events-none absolute left-3 top-3 rounded-md border border-white/15 bg-black/60 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-white backdrop-blur-sm">
           ELA
         </span>
-        <span className="pointer-events-none absolute right-3 top-3 rounded-md bg-surface-950/80 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-slate-400">
+        <span className="pointer-events-none absolute right-3 top-3 rounded-md border border-white/15 bg-black/60 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-white backdrop-blur-sm">
           Original
         </span>
       </div>
 
-      <p className="text-center text-xs text-slate-500">
+      <p className="text-center text-xs text-faint">
         Drag the divider (or focus it and use arrow keys) to compare compression error against the original.
       </p>
     </div>
