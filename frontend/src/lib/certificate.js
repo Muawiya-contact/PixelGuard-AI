@@ -20,12 +20,26 @@
  * a capped edge is the right trade: a PNG of the same photo pushed a typical
  * certificate past 1.2 MB, which is unusable as an email attachment.
  */
-function toBoundedImage(src, maxEdge = 520, quality = 0.82) {
+function toBoundedImage(source, maxEdge = 520, quality = 0.82) {
   return new Promise((resolve) => {
-    if (!src) {
+    if (!source) {
       resolve(null)
       return
     }
+    // A Blob/File is turned into a fresh URL here and released immediately, so
+    // the certificate never depends on a URL owned by component state.
+    const isBlob = typeof Blob !== 'undefined' && source instanceof Blob
+    let src = source
+    let owned = null
+    if (isBlob) {
+      try {
+        src = owned = URL.createObjectURL(source)
+      } catch {
+        resolve(null)
+        return
+      }
+    }
+    const release = () => { if (owned) URL.revokeObjectURL(owned) }
     if (typeof document === 'undefined' || typeof Image === 'undefined') {
       resolve(null) // no DOM (SSR, tests) — the certificate is still valid without art
       return
@@ -46,12 +60,15 @@ function toBoundedImage(src, maxEdge = 520, quality = 0.82) {
         ctx.fillStyle = '#ffffff'
         ctx.fillRect(0, 0, w, h)
         ctx.drawImage(img, 0, 0, w, h)
-        resolve({ dataUrl: canvas.toDataURL('image/jpeg', quality), width: w, height: h })
+        const dataUrl = canvas.toDataURL('image/jpeg', quality)
+        release()
+        resolve({ dataUrl, width: w, height: h })
       } catch {
+        release()
         resolve(null) // tainted canvas or no 2d context — the PDF is still valid without art
       }
     }
-    img.onerror = () => resolve(null)
+    img.onerror = () => { release(); resolve(null) }
     img.src = src
   })
 }
@@ -279,6 +296,10 @@ export async function buildCertificate(result, originalSrc = null) {
         const w = img.width * scale
         const h = img.height * scale
         doc.addImage(img.dataUrl, 'JPEG', left + (slot - w) / 2, y + (boxH - h) / 2, w, h)
+      } else {
+        // An empty frame reads as a rendering fault; say what happened instead.
+        doc.setFontSize(8).setTextColor(...INK.muted)
+        doc.text('Image not available', left + slot / 2, y + boxH / 2, { align: 'center' })
       }
       doc.setFontSize(8).setTextColor(...INK.muted)
       doc.text(caption, left + slot / 2, y + boxH + 13, { align: 'center' })

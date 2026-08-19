@@ -417,15 +417,11 @@ export default function App() {
   const [result, setResult] = useState(null)
   const [certifying, setCertifying] = useState(false)
 
-  // One ref mirrors the live object URL so unmount can revoke it without
-  // making the effect depend on (and therefore re-run with) preview state.
-  const previewRef = useRef(null)
-  useEffect(() => {
-    previewRef.current = previewUrl
-  }, [previewUrl])
-  useEffect(() => () => {
-    if (previewRef.current) URL.revokeObjectURL(previewRef.current)
-  }, [])
+  // Object URLs are revoked when replaced or cleared (below) but deliberately
+  // NOT on unmount: React Fast Refresh and StrictMode both remount components
+  // in development, and an unmount-time revoke kills a URL that the surviving
+  // state still points at — the preview silently blanks. The browser reclaims
+  // these when the document goes away, so there is nothing to gain here.
 
   const applyFile = useCallback((picked, pickError) => {
     if (pickError) {
@@ -480,7 +476,7 @@ export default function App() {
     if (certifying || !result) return
     setCertifying(true)
     try {
-      await downloadCertificate(result, previewUrl)
+      await downloadCertificate(result, file)
     } catch (err) {
       setError(`Could not generate certificate: ${err.message}`)
     } finally {
