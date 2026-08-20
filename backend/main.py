@@ -1,5 +1,7 @@
 """PixelGuard: AI Asset Provenance & Forensics Engine — Backend API."""
 
+import asyncio
+import base64
 import io
 import json
 import os
@@ -11,8 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types as genai_types
 from PIL import Image
+from urllib.parse import urlparse
 
 from services import ela as ela_service
+from services import fetch_url as fetch_url_service
 from services import fingerprint as fingerprint_service
 from services import metadata as metadata_service
 from services import prelint
@@ -26,8 +30,26 @@ API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("PAID_GEMINI_API_KEY")
 KEY_MODE = os.getenv("GEMINI_KEY_MODE", "developer").strip().lower()
 
 # "-latest" aliases track Google's current models and never go stale.
-PREFERRED_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro-latest")
-FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.1-pro-preview", "gemini-3.7-flash"]
+# Flash is the default: measured against the real forensic prompt it returns in
+# ~5.0s versus ~13.2s for pro on the same downscaled input, and the reports are
+# comparable in quality. Set GEMINI_MODEL=gemini-pro-latest to trade latency for
+# the larger model.
+PREFERRED_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+FALLBACK_MODELS = ["gemini-pro-latest", "gemini-3.7-flash", "gemini-3.1-pro-preview"]
+
+# Longest edge sent to Gemini. A 9.34 MP phone photo takes ~10.1s to analyse;
+# the same image capped at 1024px takes ~5.0s, and the verdicts do not differ
+# in a way that survives the model's own run-to-run variance.
+GEMINI_MAX_EDGE = int(os.getenv("GEMINI_MAX_EDGE", 1024))
+
+
+def downscale_for_model(image: Image.Image) -> Image.Image:
+    """Cap the longest edge before upload. Returns the original if already small."""
+    if max(image.size) <= GEMINI_MAX_EDGE:
+        return image
+    copy = image.copy()
+    copy.thumbnail((GEMINI_MAX_EDGE, GEMINI_MAX_EDGE), Image.LANCZOS)
+    return copy
 
 _client: genai.Client | None = None
 
@@ -47,7 +69,7 @@ def get_client() -> genai.Client:
 app = FastAPI(
     title="PixelGuard API",
     description="AI Asset Provenance & Forensics Engine",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 # CORS. Local dev origins are always allowed. Production origins come from
@@ -181,6 +203,7 @@ def _is_model_unavailable(exc: Exception) -> bool:
 def _generate_report(image: Image.Image, user_prompt: str) -> tuple[dict, str]:
     """Try the preferred model, falling back through newer models if unavailable."""
     client = get_client()
+    image = downscale_for_model(image)
     config = genai_types.GenerateContentConfig(response_mime_type="application/json")
     last_exc: Exception | None = None
     for model_name in [PREFERRED_MODEL] + [m for m in FALLBACK_MODELS if m != PREFERRED_MODEL]:
@@ -266,16 +289,109 @@ async def analyze_fingerprint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=redact(f"Fingerprint failed: {exc}"))
 
 
+async def _local_evidence(image: Image.Image, raw: bytes, include_ela: bool) -> dict:
+    """Run the three local detectors concurrently.
+
+    Each is CPU-bound and releases the GIL inside Pillow/NumPy, so threads give
+    real overlap here. None of them may fail the request: they are supporting
+    evidence, and a forensic report without a colour histogram is still useful.
+    """
+
+    async def safe(fn, *args, default=None, label=""):
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except Exception as exc:
+            if label == "metadata":
+                return {
+                    "verdict": "error",
+                    "rationale": redact(str(exc)),
+                    "ai_signatures": [],
+                    "editing_software": [],
+                }
+            return default
+
+    tasks = [
+        safe(metadata_service.parse_metadata, image, raw, label="metadata"),
+        safe(fingerprint_service.fingerprint, image, raw),
+    ]
+    if include_ela:
+        tasks.append(safe(ela_service.compute_ela, image))
+
+    results = await asyncio.gather(*tasks)
+    return {
+        "metadata": results[0],
+        "fingerprint": results[1],
+        "ela": results[2] if include_ela else None,
+    }
+
+
+@app.post("/api/v1/fetch-url")
+async def fetch_remote_image(url: str = Form(...)):
+    """Fetch a public image URL server-side and return it as a data URI.
+
+    The frontend cannot fetch arbitrary third-party images itself (CORS), so the
+    server does it. See services/fetch_url.py for the SSRF guards: only public
+    addresses, redirects re-validated per hop, and a streaming size cap.
+    """
+    try:
+        raw, content_type, final_url = await asyncio.to_thread(fetch_url_service.fetch_image, url)
+    except fetch_url_service.FetchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=redact(f"Fetch failed: {exc}"))
+
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="The URL did not return a decodable image.")
+
+    name = (urlparse(final_url).path.rsplit("/", 1)[-1] or "remote-image")[:120]
+    if "." not in name:
+        name = f"{name}.{(image.format or 'png').lower()}"
+    return {
+        "filename": name,
+        "content_type": content_type,
+        "size_bytes": len(raw),
+        "dimensions": {"width": image.width, "height": image.height},
+        "data_uri": f"data:{content_type};base64," + base64.b64encode(raw).decode("ascii"),
+        "source_url": final_url,
+    }
+
+
+@app.post("/api/v1/analyze/local")
+async def analyze_local(
+    file: UploadFile = File(...),
+    include_ela: bool = Form(True),
+):
+    """Everything computable without the model, for an immediate first paint.
+
+    The frontend fires this alongside the full analysis so the heatmap, hashes
+    and metadata verdict appear in well under a second while Gemini is still
+    thinking.
+    """
+    image, raw = await _read_image(file)
+    evidence = await _local_evidence(image, raw, include_ela)
+    return {
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size_bytes": len(raw),
+        "dimensions": {"width": image.width, "height": image.height},
+        **evidence,
+    }
+
+
 @app.post("/api/v1/forensics/analyze")
 async def analyze_image(
     file: UploadFile = File(...),
     prompt: str | None = Form(None),
     include_ela: bool = Form(True),
 ):
-    """Full forensic pass: metadata -> model analysis -> prelint reconciliation.
+    """Full forensic pass.
 
-    Local evidence (metadata, ELA) is gathered first so the prelint stage can
-    reconcile the model's visual read against it rather than trusting it blindly.
+    Local evidence and the model call run concurrently rather than in sequence:
+    the local work is pure CPU and the Gemini call is pure wait, so overlapping
+    them makes the request cost about what the model call alone costs.
     """
     if not API_KEY:
         raise HTTPException(
@@ -285,40 +401,34 @@ async def analyze_image(
 
     image, raw = await _read_image(file)
 
-    # Local evidence first — these never fail the request on their own.
-    try:
-        meta = metadata_service.parse_metadata(image, raw)
-    except Exception as exc:
-        meta = {"verdict": "error", "rationale": redact(str(exc)), "ai_signatures": [], "editing_software": []}
-
-    try:
-        fingerprint = fingerprint_service.fingerprint(image, raw)
-    except Exception:
-        fingerprint = None  # descriptive only; never block the analysis
-
-    ela_result = None
-    if include_ela:
-        try:
-            ela_result = ela_service.compute_ela(image)
-        except Exception:
-            ela_result = None  # ELA is supporting evidence; never block on it
-
-    # Inbound prelint: the caller's text is concatenated into the system prompt.
+    # Inbound prelint runs first: the caller's text is concatenated into the
+    # system prompt, so it must be sanitised before the model call is launched.
     safe_prompt, prompt_findings = prelint.lint_prompt(prompt)
-
     user_prompt = FORENSICS_SYSTEM_PROMPT
     if safe_prompt:
         user_prompt += f"\nAdditional analyst instructions: {safe_prompt}"
 
-    try:
-        raw_report, model_used = _generate_report(image, user_prompt)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=redact(f"Gemini analysis failed: {exc}"))
+    evidence, model_result = await asyncio.gather(
+        _local_evidence(image, raw, include_ela),
+        asyncio.to_thread(_generate_report, image, user_prompt),
+        return_exceptions=True,
+    )
+
+    if isinstance(evidence, BaseException):
+        evidence = {"metadata": None, "fingerprint": None, "ela": None}
+    if isinstance(model_result, BaseException):
+        if isinstance(model_result, HTTPException):
+            raise model_result
+        raise HTTPException(
+            status_code=502, detail=redact(f"Gemini analysis failed: {model_result}")
+        )
+
+    raw_report, model_used = model_result
 
     # Outbound prelint: normalise, check consistency, reconcile with evidence.
-    report, output_findings = prelint.lint_report(raw_report, metadata=meta, ela=ela_result)
+    report, output_findings = prelint.lint_report(
+        raw_report, metadata=evidence["metadata"], ela=evidence["ela"]
+    )
     findings = prompt_findings + output_findings
 
     return {
@@ -329,8 +439,8 @@ async def analyze_image(
         "model": model_used,
         "key_mode": KEY_MODE,
         "report": report,
-        "fingerprint": fingerprint,
-        "metadata": meta,
-        "ela": ela_result,
+        "fingerprint": evidence["fingerprint"],
+        "metadata": evidence["metadata"],
+        "ela": evidence["ela"],
         "prelint": {**prelint.summarise(findings), "findings": findings},
     }

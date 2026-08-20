@@ -151,6 +151,37 @@ jobs:
           assert reconciled["verdict"] == "ai_generated", reconciled["verdict"]
           assert any(f["code"] == "metadata_overrides_verdict" for f in out2), out2
 
+          # --- SSRF guards on the URL intake ---
+          for bad in (
+              "http://169.254.169.254/latest/meta-data/",   # cloud metadata
+              "http://127.0.0.1:8000/api/v1/health",        # loopback
+              "http://10.0.0.1/x.png",                      # RFC1918
+              "http://192.168.1.1/x.png",
+              "http://[::1]:8000/",                         # ipv6 loopback
+              "file:///etc/passwd",                         # non-http scheme
+              "gopher://evil/x",
+          ):
+              r = client.post("/api/v1/fetch-url", data={"url": bad})
+              assert r.status_code == 400, f"{bad} was not rejected: {r.status_code} {r.text[:120]}"
+          print("SSRF guards rejected all private/loopback/scheme probes")
+
+          # --- local-only pass returns evidence without a model call ---
+          buf = io.BytesIO(); base.save(buf, "PNG")
+          r = client.post("/api/v1/analyze/local", files={"file": ("l.png", buf.getvalue(), "image/png")})
+          assert r.status_code == 200, r.text
+          local = r.json()
+          assert local["fingerprint"]["sha256"], "local pass returned no fingerprint"
+          assert local["metadata"]["verdict"], "local pass returned no metadata verdict"
+          assert local["ela"]["heatmap"].startswith("data:image/png;base64,"), "local pass returned no heatmap"
+          print("local pass ->", local["metadata"]["verdict"])
+
+          # --- downscale guard: oversized input is capped before the model ---
+          big = Image.new("RGB", (3000, 2000), (10, 20, 30))
+          capped = main.downscale_for_model(big)
+          assert max(capped.size) == main.GEMINI_MAX_EDGE, capped.size
+          assert main.downscale_for_model(base) is base, "small images must not be copied"
+          print("downscale ->", big.size, "->", capped.size)
+
           # --- upload guards ---
           assert client.post("/api/v1/analyze/ela", files={"file": ("e.png", b"", "image/png")}).status_code == 400
           assert client.post("/api/v1/analyze/ela", files={"file": ("g.png", b"nope", "image/png")}).status_code == 400

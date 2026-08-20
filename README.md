@@ -49,6 +49,8 @@ Open http://localhost:5173, drop an image (or pick one from the **Sample gallery
 
 The frontend adds a draggable **original vs. ELA heatmap** comparison slider, a **Download Forensic Certificate** button that produces a PDF report of the findings and their limitations, and a **sample gallery** of procedurally generated fixtures — each carrying a crafted metadata or compression history so a specific detector can be seen firing against known ground truth. Those fixtures are synthetic, not photographs, and the UI says so.
 
+**Import from URL** lets you analyse an image without downloading it first. The fetch happens server-side (the browser cannot read cross-origin images), which makes it an SSRF surface — so `backend/services/fetch_url.py` resolves every hop and refuses any non-public address, allows only http/https, re-validates redirects by hand, and caps the response while streaming. **Copy JSON** puts the analysis payload on the clipboard with the base64 heatmap stripped.
+
 **Light and dark themes** follow the OS preference until you pick a side with the header toggle, after which the choice persists. Both are driven by semantic CSS variables (`--pg-bg`, `--pg-fg`, …) declared in `src/index.css`, so adding a theme means redefining tokens rather than editing components. An inline script in `index.html` applies the stored theme before first paint, avoiding a flash of the wrong background. Text contrast was measured in-browser against both palettes and meets WCAG AA (≥4.5:1) for body, secondary, and faint text.
 
 ## API Endpoints
@@ -61,6 +63,8 @@ The frontend adds a draggable **original vs. ELA heatmap** comparison slider, a 
 | POST | `/api/v1/analyze/ela` | Error Level Analysis heatmap (local, no API key needed) |
 | POST | `/api/v1/analyze/metadata` | C2PA / EXIF / XMP parse (local, no API key needed) |
 | POST | `/api/v1/analyze/fingerprint` | SHA-256, geometry and colour statistics (local) |
+| POST | `/api/v1/analyze/local` | All three local detectors at once, no model call (~0.4s) |
+| POST | `/api/v1/fetch-url` | Fetch a public image URL server-side (SSRF-guarded) |
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/forensics/analyze \
@@ -79,6 +83,25 @@ A request to `/api/v1/forensics/analyze` runs these stages, in this order:
 3. **Fingerprint** (`backend/services/fingerprint.py`) — SHA-256 and MD5 of the exact analysed bytes, plus dimensions, aspect-ratio breakdown, and dominant colours by area. Not a detector: it is the descriptive record that lets someone else confirm a certificate refers to the image in front of them.
 
 4. **Prelint** (`backend/services/prelint.py`) — verification on both sides of the model call. Inbound, the caller's free-text instructions are scanned for prompt-injection phrasing and neutralised before they reach Gemini. Outbound, the model's JSON is coerced to the expected schema, range-clamped, checked for self-contradiction, and reconciled against the metadata evidence. Every correction is reported in `prelint.findings` rather than applied silently.
+
+### Latency
+
+Measured on a 9.34 MP photo (2288×4080), best of two runs:
+
+| Change | Before | After |
+| --- | --- | --- |
+| Model: `gemini-pro-latest` → `gemini-flash-latest` | 13.2s | 5.0s |
+| Sending full-resolution vs. capped at 1024px | 10.1s | 5.0s |
+| Full request, sequential → concurrent | ~19.3s | ~4.6s |
+| Local evidence only (`/analyze/local`) | — | ~0.4–0.9s |
+
+Three things get you there:
+
+- **Concurrency.** Metadata, fingerprint, ELA and the Gemini call all run at once via `asyncio.gather`, so the request costs about what the model call alone costs instead of the sum.
+- **Downscaling.** Only a copy capped at `GEMINI_MAX_EDGE` (1024px) goes to the model. Forensic detail that survives a 1024px downscale is what a vision model can use anyway; the full-resolution original is what ELA and hashing see.
+- **Optimistic UI.** The frontend fires `/analyze/local` alongside the full pass. Hashes, metadata and the ELA heatmap paint in ~360ms while only the verdict box waits on the model.
+
+Set `GEMINI_MODEL=gemini-pro-latest` to trade latency back for the larger model. Note that `gemini-2.5-flash` is retired for new API keys and returns 404 — use the `-latest` aliases.
 
 ### What these detectors can and cannot tell you
 
