@@ -7,6 +7,22 @@ Enterprise Generative Media Provenance &amp; Forensics Suite. Detects tampering 
 
 Tags: python, fastapi, pytorch, opencv, gemini-api, c2pa, provenance, ai-security, media-forensics, generative-ai
 
+## Demo
+
+| | |
+| --- | --- |
+| **Live app** | **https://pixel-guard-ai-nine.vercel.app/** |
+| **Backend health** | https://pixelguard-ai.onrender.com/api/v1/health |
+| **API docs** | https://pixelguard-ai.onrender.com/docs |
+
+[▶ Watch the 3-minute demo](docs/pixelguard-demo.mp4) — 1280×720, 3:00, recorded against the deployed app. Silent, with on-screen captions.
+
+A [sample forensic certificate](docs/sample-forensic-certificate.pdf) exported during that recording is included too.
+
+The demo runs one investigation end to end: an AI-generated fixture is analysed, the metadata parser finds a Stable Diffusion signature that contradicts the model's visual read, and `metadata_overrides_verdict` reports the reconciliation rather than hiding it. A second fixture then shows `exif_visual_media_conflict`, where camera EXIF and the visual read disagree and PixelGuard reports the disagreement instead of picking a side.
+
+> The backend runs on Render's free tier, which sleeps after ~15 minutes idle. **The first request can take ~23 seconds**; every request after that is ~8 seconds. Hit the health endpoint once to wake it before demoing.
+
 ## Architecture
 
 Monorepo with two independently deployable apps:
@@ -17,7 +33,7 @@ PixelGuard-AI/
 └── backend/    Python + FastAPI + Uvicorn   →  Render / Hugging Face Spaces (Docker)
 ```
 
-The backend wraps **Gemini 1.5 Pro** as the forensic analysis engine: upload an image, receive a structured JSON report with an integrity score, tampering indicators, and a suspected AI model signature.
+The backend wraps **Gemini** (`gemini-flash-latest` by default) as the visual analysis engine: upload an image, receive a structured JSON report with a media-type classification, an integrity score, tampering indicators, and a suspected generator signature — reconciled against metadata and ELA evidence before it is returned.
 
 ## Quick Start (Local)
 
