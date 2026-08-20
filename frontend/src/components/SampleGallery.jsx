@@ -31,7 +31,7 @@ export default function SampleGallery({ onPick, disabled }) {
           samples: (
             await Promise.all(
               cat.samples.map(async (s) => {
-                const url = await resolveSampleUrl(cat.dir, s.slot)
+                const url = await resolveSampleUrl(cat.dir, s.file)
                 return url ? { ...s, url } : null
               }),
             )
@@ -45,13 +45,13 @@ export default function SampleGallery({ onPick, disabled }) {
 
   const pick = async (cat, sample) => {
     if (disabled || loading) return
-    const key = `${cat.id}/${sample.slot}`
+    const key = `${cat.id}/${sample.file}`
     setLoading(key)
     try {
       const res = await fetch(sample.url)
       if (!res.ok) throw new Error(`Sample unavailable (${res.status})`)
       const blob = await res.blob()
-      onPick(new File([blob], sample.url.split('/').pop(), { type: blob.type }))
+      onPick(new File([blob], sample.file, { type: blob.type }))
     } catch (err) {
       onPick(null, err.message)
     } finally {
@@ -85,9 +85,8 @@ export default function SampleGallery({ onPick, disabled }) {
             </div>
           ) : total === 0 ? (
             <p className="break-anywhere px-1 py-4 text-[11px] leading-relaxed text-faint">
-              No sample images found. Add files named <code>sample1</code>–<code>sample3</code> to{' '}
-              <code>public/images/ai-generated/</code>, <code>public/images/camera-exif/</code> or{' '}
-              <code>public/images/composite/</code>.
+              No sample images found. Add files under <code>public/images/&lt;category&gt;/</code> and
+              list them in <code>src/constants/samples.js</code>.
             </p>
           ) : (
             <div className="flex flex-col gap-4">
@@ -100,13 +99,14 @@ export default function SampleGallery({ onPick, disabled }) {
 
                   {cat.samples.length === 0 ? (
                     <p className="break-anywhere rounded-lg border border-dashed border-line px-3 py-2 text-[11px] text-faint">
-                      Nothing in <code>{cat.dir}/</code> yet — add <code>sample1</code>–<code>sample3</code>.
+                      Nothing found in <code>{cat.dir}/</code> — check the filenames listed in{' '}
+                      <code>samples.js</code>.
                     </p>
                   ) : (
                     <div className="grid gap-2 sm:grid-cols-3">
                       {cat.samples.map((s) => (
                         <button
-                          key={s.slot}
+                          key={s.file}
                           onClick={() => pick(cat, s)}
                           disabled={disabled || loading !== null}
                           title={cat.expects}
@@ -119,7 +119,7 @@ export default function SampleGallery({ onPick, disabled }) {
                               loading="lazy"
                               className="h-full w-full object-cover opacity-90 transition-opacity group-hover:opacity-100"
                             />
-                            {loading === `${cat.id}/${s.slot}` && (
+                            {loading === `${cat.id}/${s.file}` && (
                               <div className="absolute inset-0 flex items-center justify-center bg-black/60">
                                 <Loader2 size={20} className="animate-spin text-accent" />
                               </div>
