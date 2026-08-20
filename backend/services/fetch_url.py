@@ -17,7 +17,12 @@ from urllib.parse import urlparse
 
 import httpx
 
-MAX_BYTES = 15 * 1024 * 1024
+MAX_BYTES = 10 * 1024 * 1024
+
+# Formats the pipeline can actually decode and reason about. An allowlist rather
+# than a "starts with image/" check: image/svg+xml is a script container, not a
+# raster image, and has no place going near a forensics pipeline.
+ALLOWED_MIME = ("image/jpeg", "image/jpg", "image/png", "image/webp")
 TIMEOUT_SECONDS = 15.0
 MAX_REDIRECTS = 3
 
@@ -114,6 +119,62 @@ def fetch_image(url: str) -> tuple[bytes, str, str]:
                             f"URL returned {content_type}, not an image."
                         )
                     return body, content_type or "image/*", current
+            except httpx.RequestError as exc:
+                raise FetchError(f"Could not reach the URL: {type(exc).__name__}")
+
+    raise FetchError("Too many redirects.")
+
+
+async def fetch_image_async(url: str) -> tuple[bytes, str, str]:
+    """Async twin of fetch_image with the same guards plus a MIME allowlist.
+
+    Kept separate rather than shared-with-a-flag: httpx's sync and async clients
+    have different streaming APIs, and interleaving them behind one code path
+    obscures which guard runs where.
+    """
+    current = _validate(url)
+
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT_SECONDS, follow_redirects=False, headers=_HEADERS
+    ) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            try:
+                async with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise FetchError("Redirect without a destination.")
+                        # Re-validated per hop: a public URL must not be able to
+                        # bounce the server onto an internal address.
+                        current = _validate(str(response.url.join(location)))
+                        continue
+
+                    if response.status_code >= 400:
+                        raise FetchError(f"Source returned HTTP {response.status_code}.")
+
+                    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                    if content_type and content_type not in ALLOWED_MIME:
+                        raise FetchError(
+                            f"URL returned {content_type}. Supported: JPEG, PNG, WebP."
+                        )
+
+                    declared = response.headers.get("content-length")
+                    if declared and int(declared) > MAX_BYTES:
+                        raise FetchError(
+                            f"Image is {int(declared) // 1024} KB; limit is {MAX_BYTES // 1024} KB."
+                        )
+
+                    chunks, total = [], 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_BYTES:
+                            raise FetchError(f"Image exceeds the {MAX_BYTES // 1024} KB limit.")
+                        chunks.append(chunk)
+
+                    body = b"".join(chunks)
+                    if not body:
+                        raise FetchError("Source returned an empty response.")
+                    return body, content_type or "image/jpeg", current
             except httpx.RequestError as exc:
                 raise FetchError(f"Could not reach the URL: {type(exc).__name__}")
 

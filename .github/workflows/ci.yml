@@ -151,6 +151,49 @@ jobs:
           assert reconciled["verdict"] == "ai_generated", reconciled["verdict"]
           assert any(f["code"] == "metadata_overrides_verdict" for f in out2), out2
 
+          # --- anti-false-positive guardrails (deterministic, no model) ---
+          CAM = {"verdict": "camera_capture_indicated", "ai_signatures": [], "editing_software": [],
+                 "camera_evidence": {"present": True, "fields": {"ISO": "200", "ExposureTime": "1/320",
+                                                                 "FocalLength": "85", "FNumber": "2.8"}}, "c2pa": {}}
+          NOMETA = {"verdict": "no_metadata", "ai_signatures": [], "editing_software": [],
+                    "camera_evidence": {"present": False, "fields": {}}, "c2pa": {}}
+          SD = {"verdict": "ai_generated",
+                "ai_signatures": [{"id": "sd", "label": "Stable Diffusion", "source": "metadata"}],
+                "editing_software": [],
+                "camera_evidence": {"present": True, "fields": {"ISO": "200"}}, "c2pa": {}}
+
+          def run(verdict, conf, meta):
+              return prelint.lint_report({
+                  "verdict": verdict, "integrity_score": 50, "confidence": conf,
+                  "tampering_detection": {"detected": False, "indicators": []},
+                  "model_signature": {"likely_ai_generated": True, "suspected_model_family": None,
+                                      "signature_evidence": []},
+                  "summary": "x"}, metadata=meta)
+
+          # RULE B: organic capture EXIF outranks a visual AI call...
+          c, f = run("ai_generated", 88, CAM)
+          assert c["verdict"] == "authentic", c["verdict"]
+          assert any(x["code"] == "organic_exif_priority" for x in f), f
+          # ...but a hard generator manifest outranks the EXIF.
+          c, f = run("ai_generated", 88, SD)
+          assert c["verdict"] == "ai_generated", c["verdict"]
+
+          # RULE A: low confidence with nothing to corroborate it.
+          c, f = run("ai_generated", 60, NOMETA)
+          assert c["verdict"] == "authentic", c["verdict"]
+          assert any(x["code"] == "false_positive_guardrail_applied" for x in f), f
+          # The threshold is exclusive: 75 must survive.
+          c, f = run("ai_generated", 75, NOMETA)
+          assert c["verdict"] == "ai_generated", c["verdict"]
+          print("guardrails: Rule A and Rule B behave as specified")
+
+          # The strict prompt must keep its anti-false-positive clauses.
+          from services.gemini import FORENSICS_SYSTEM_PROMPT
+          for needle in ("CRITICAL ASSUMPTION", "ANTI-FALSE-POSITIVE MANDATE",
+                         "STRICT VERDICT THRESHOLDS", "portrait-mode", "pseudotext"):
+              assert needle in FORENSICS_SYSTEM_PROMPT, needle
+          print("strict prompt clauses present")
+
           # --- SSRF guards on the URL intake ---
           for bad in (
               "http://169.254.169.254/latest/meta-data/",   # cloud metadata
@@ -163,6 +206,9 @@ jobs:
           ):
               r = client.post("/api/v1/fetch-url", data={"url": bad})
               assert r.status_code == 400, f"{bad} was not rejected: {r.status_code} {r.text[:120]}"
+              # The JSON endpoint must enforce the same guards.
+              r2 = client.post("/api/v1/analyze/url", json={"url": bad})
+              assert r2.status_code in (400, 503), f"{bad} not rejected by /analyze/url: {r2.status_code}"
           print("SSRF guards rejected all private/loopback/scheme probes")
 
           # --- local-only pass returns evidence without a model call ---

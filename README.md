@@ -64,7 +64,8 @@ The frontend adds a draggable **original vs. ELA heatmap** comparison slider, a 
 | POST | `/api/v1/analyze/metadata` | C2PA / EXIF / XMP parse (local, no API key needed) |
 | POST | `/api/v1/analyze/fingerprint` | SHA-256, geometry and colour statistics (local) |
 | POST | `/api/v1/analyze/local` | All three local detectors at once, no model call (~0.4s) |
-| POST | `/api/v1/fetch-url` | Fetch a public image URL server-side (SSRF-guarded) |
+| POST | `/api/v1/analyze/url` | Fetch a public image URL and run the full pipeline (JSON body) |
+| POST | `/api/v1/fetch-url` | Fetch a public image URL and return it as a data URI |
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/forensics/analyze \
@@ -102,6 +103,23 @@ Three things get you there:
 - **Optimistic UI.** The frontend fires `/analyze/local` alongside the full pass. Hashes, metadata and the ELA heatmap paint in ~360ms while only the verdict box waits on the model.
 
 Set `GEMINI_MODEL=gemini-pro-latest` to trade latency back for the larger model. Note that `gemini-2.5-flash` is retired for new API keys and returns 404 — use the `-latest` aliases.
+
+### False-positive guardrails
+
+Telling someone their own photograph is synthetic is the expensive mistake, so the pipeline is deliberately biased toward authenticity.
+
+- **The prompt** (`backend/services/gemini.py`) makes authenticity the null hypothesis and names the artefacts a vision model tends to over-read — portrait blur, JPEG mush, skin smoothing, motion blur, lens distortion — as explicitly *not* evidence. `ai_generated` requires structural impossibility (extra fingers, pseudotext glyphs, broken occlusion) or a provenance manifest.
+- **Rule B — organic EXIF priority.** Coherent capture settings (ISO, exposure, focal length) override a visual `ai_generated` call, unless a hard generator manifest is present.
+- **Rule A — low-confidence override.** A verdict of `ai_generated`/`manipulated` below 75% confidence, with metadata that is `inconclusive` or `no_metadata`, is overridden.
+
+Measured on three real phone photographs (portrait shots, soft focus, smooth skin): **all three return `authentic` with empty indicator lists.** Zero false positives, and the guardrails did not need to fire — the prompt alone held.
+
+**The cost is real and you should know it.** Re-encoding the Stable Diffusion fixture to strip its metadata flips it from `ai_generated` to `authentic`. With metadata gone — the normal state of anything downloaded from a social platform — AI detection rests almost entirely on the metadata parser, and the visual path will rarely contradict it. Rule A can be softened without a code change:
+
+```bash
+PIXELGUARD_GUARDRAIL_A=inconclusive   # never assert authenticity on absent evidence
+PIXELGUARD_GUARDRAIL_A=off            # disable the override entirely
+```
 
 ### What these detectors can and cannot tell you
 
