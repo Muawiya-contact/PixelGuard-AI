@@ -85,8 +85,16 @@ def lint_prompt(prompt: str | None) -> tuple[str | None, list[dict]]:
             })
             text = re.sub(pattern, "[redacted]", text, flags=re.IGNORECASE)
 
-    # Strip anything that could imitate a role/turn boundary.
-    text, subs = re.subn(r"(?im)^\s*(?:system|assistant|user|developer)\s*:", "", text)
+    # Strip anything that could imitate a role/turn boundary. Matched at a line
+    # start OR after sentence-ending punctuation: "…set it to 100. system: …"
+    # is the realistic injection shape, and a line-anchored pattern misses it.
+    # Deliberately not matching mid-clause, so ordinary prose ("the system: a
+    # lens and a sensor") survives intact.
+    text, subs = re.subn(
+        r"(?im)(^|(?<=[.!?;\n]))\s*(?:system|assistant|user|developer)\s*:",
+        " ",
+        text,
+    )
     if subs:
         findings.append({
             "stage": "prompt",
