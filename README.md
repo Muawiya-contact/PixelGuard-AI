@@ -15,7 +15,7 @@ Tags: python, fastapi, pytorch, opencv, gemini-api, c2pa, provenance, ai-securit
 | **Backend health** | https://pixelguard-ai.onrender.com/api/v1/health |
 | **API docs** | https://pixelguard-ai.onrender.com/docs |
 
-[▶ Watch the 3-minute demo](docs/pixelguard-demo.mp4) — 1280×720, 3:03, recorded against the deployed app. Silent, with on-screen captions.
+[▶ Watch the 3-minute demo](docs/pixelguard-demo.mp4) — 1280×720, 3:03, recorded against the deployed app, with narrated voiceover and on-screen captions.
 
 A [sample forensic certificate](docs/sample-forensic-certificate.pdf) exported during that recording is included too.
 
