@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 google-genai
+httpx
 python-multipart
 pillow
 numpy

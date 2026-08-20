@@ -1,79 +1,26 @@
 /**
- * Build a forensic certificate PDF from an analysis result.
+ * Single-page forensic certificate.
  *
- * jsPDF is imported dynamically: it drags in html2canvas and roughly 200 KB of
- * transitive weight that nobody needs until the download button is pressed, so
- * keeping it out of the entry chunk buys a materially faster first paint.
- *
- * The document is written to be defensible rather than impressive: it records
- * what was examined, what each detector reported, and — importantly — the
- * limits of those detectors. A certificate that implied more certainty than the
- * analysis supports would be worse than no certificate at all.
+ * The whole document is constrained to one A4 page by construction: addPage()
+ * is never called, every block is measured before it is drawn, and anything
+ * that would run past the reserved footer is truncated with an explicit
+ * "+N more" note. That keeps the output predictable for any image aspect ratio
+ * or finding count, at the cost of showing fewer findings on busy reports —
+ * the full set is always available in the app and the JSON payload.
  */
 
-/**
- * Load an image and re-encode it as a bounded JPEG data URI.
- *
- * jsPDF needs raw image data, and an object URL is not that. These renders are
- * a visual reference so a reader can see what was examined — the SHA-256 in the
- * evidence table is the authoritative identifier, not these pixels — so JPEG at
- * a capped edge is the right trade: a PNG of the same photo pushed a typical
- * certificate past 1.2 MB, which is unusable as an email attachment.
- */
-function toBoundedImage(source, maxEdge = 520, quality = 0.82) {
-  return new Promise((resolve) => {
-    if (!source) {
-      resolve(null)
-      return
-    }
-    // A Blob/File is turned into a fresh URL here and released immediately, so
-    // the certificate never depends on a URL owned by component state.
-    const isBlob = typeof Blob !== 'undefined' && source instanceof Blob
-    let src = source
-    let owned = null
-    if (isBlob) {
-      try {
-        src = owned = URL.createObjectURL(source)
-      } catch {
-        resolve(null)
-        return
-      }
-    }
-    const release = () => { if (owned) URL.revokeObjectURL(owned) }
-    if (typeof document === 'undefined' || typeof Image === 'undefined') {
-      resolve(null) // no DOM (SSR, tests) — the certificate is still valid without art
-      return
-    }
-    const img = new Image()
-    img.crossOrigin = 'anonymous'
-    img.onload = () => {
-      try {
-        const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight))
-        const w = Math.max(1, Math.round(img.naturalWidth * scale))
-        const h = Math.max(1, Math.round(img.naturalHeight * scale))
-        const canvas = document.createElement('canvas')
-        canvas.width = w
-        canvas.height = h
-        const ctx = canvas.getContext('2d')
-        // JPEG has no alpha; paint white first so transparent PNGs do not
-        // flatten onto black.
-        ctx.fillStyle = '#ffffff'
-        ctx.fillRect(0, 0, w, h)
-        ctx.drawImage(img, 0, 0, w, h)
-        const dataUrl = canvas.toDataURL('image/jpeg', quality)
-        release()
-        resolve({ dataUrl, width: w, height: h })
-      } catch {
-        release()
-        resolve(null) // tainted canvas or no 2d context — the PDF is still valid without art
-      }
-    }
-    img.onerror = () => { release(); resolve(null) }
-    img.src = src
-  })
+const PAGE = { W: 595.28, H: 841.89 }
+const MX = 32 // side margin
+const MY = 12 // top/bottom margin, per spec
+
+const INK = {
+  heading: [226, 232, 240],
+  body: [30, 41, 59],
+  muted: [90, 105, 125],
+  faint: [130, 145, 165],
+  rule: [210, 218, 228],
+  panel: [247, 249, 251],
 }
-
-const INK = { heading: [226, 232, 240], body: [51, 65, 85], muted: [100, 116, 139], rule: [203, 213, 225] }
 const ACCENT = [8, 145, 178]
 
 const VERDICT_LABEL = {
@@ -82,7 +29,6 @@ const VERDICT_LABEL = {
   manipulated: 'Manipulated',
   inconclusive: 'Inconclusive',
 }
-
 const VERDICT_COLOR = {
   authentic: [16, 133, 96],
   ai_generated: [155, 44, 155],
@@ -91,8 +37,6 @@ const VERDICT_COLOR = {
 }
 
 function fmtStamp(date) {
-  // A certificate is read by people: "19 Aug 2026, 19:39:09 UTC" beats an ISO
-  // string. The exact ISO form still appears in the footer for machine use.
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
   const p = (n) => String(n).padStart(2, '0')
   return `${date.getUTCDate()} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}, ` +
@@ -106,274 +50,316 @@ function fmtBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+/**
+ * Load an image and re-encode it as a small JPEG data URI.
+ *
+ * Oversampled relative to the 60pt frame so it stays crisp when the PDF is
+ * zoomed, but still tiny. The SHA-256 in the fingerprint grid is what actually
+ * identifies the bytes; these are visual references.
+ */
+function toBoundedImage(source, maxEdge = 240, quality = 0.8) {
+  return new Promise((resolve) => {
+    if (!source) return resolve(null)
+    if (typeof document === 'undefined' || typeof Image === 'undefined') return resolve(null)
+
+    const isBlob = typeof Blob !== 'undefined' && source instanceof Blob
+    let src = source
+    let owned = null
+    if (isBlob) {
+      try { src = owned = URL.createObjectURL(source) } catch { return resolve(null) }
+    }
+    const release = () => { if (owned) URL.revokeObjectURL(owned) }
+
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight))
+        const w = Math.max(1, Math.round(img.naturalWidth * scale))
+        const h = Math.max(1, Math.round(img.naturalHeight * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, w, h)
+        ctx.drawImage(img, 0, 0, w, h)
+        const dataUrl = canvas.toDataURL('image/jpeg', quality)
+        release()
+        resolve({ dataUrl, width: w, height: h })
+      } catch {
+        release()
+        resolve(null)
+      }
+    }
+    img.onerror = () => { release(); resolve(null) }
+    img.src = src
+  })
+}
+
 export async function buildCertificate(result, originalSrc = null) {
   if (!result) throw new Error('No analysis result to certify.')
-
   const { jsPDF } = await import('jspdf')
 
-  const doc = new jsPDF({ unit: 'pt', format: 'a4' })
-  const W = doc.internal.pageSize.getWidth()
-  const H = doc.internal.pageSize.getHeight()
-  const M = 48
+  const doc = new jsPDF({ unit: 'pt', format: 'a4', compress: true })
   const issued = new Date()
-  let y = 0
 
   const report = result.report || {}
-  const verdict = report.verdict || 'inconclusive'
-  const score = Number.isFinite(report.integrity_score) ? report.integrity_score : null
-
-  // --- header band -------------------------------------------------------
-  doc.setFillColor(11, 14, 23)
-  doc.rect(0, 0, W, 96, 'F')
-  doc.setTextColor(...INK.heading)
-  doc.setFont('helvetica', 'bold').setFontSize(20)
-  doc.text('PixelGuard', M, 44)
-  // Measure rather than assume: a hardcoded offset collides the moment the
-  // font metrics differ from whatever was eyeballed.
-  const brandWidth = doc.getTextWidth('PixelGuard')
-  doc.setTextColor(...ACCENT)
-  doc.text('Forensic Certificate', M + brandWidth + 12, 44)
-  doc.setFont('helvetica', 'normal').setFontSize(9)
-  doc.setTextColor(148, 163, 184)
-  doc.text('AI Asset Provenance & Forensics Engine', M, 62)
-  doc.text(`Issued ${fmtStamp(issued)}`, M, 76)
-  y = 128
-
-  // --- verdict + score ---------------------------------------------------
-  const vc = VERDICT_COLOR[verdict] || VERDICT_COLOR.inconclusive
-  doc.setFillColor(...vc)
-  doc.roundedRect(M, y - 22, 168, 32, 6, 6, 'F')
-  doc.setTextColor(255, 255, 255).setFont('helvetica', 'bold').setFontSize(13)
-  doc.text(VERDICT_LABEL[verdict] || 'Inconclusive', M + 14, y - 1)
-
-  doc.setTextColor(...INK.body).setFontSize(11).setFont('helvetica', 'normal')
-  doc.text(`Integrity score: ${score === null ? 'not reported' : `${score} / 100`}`, M + 190, y - 12)
-  const conf = Number.isFinite(report.confidence) ? `${report.confidence}%` : 'not reported'
-  doc.text(`Model confidence: ${conf}`, M + 190, y + 4)
-  y += 34
-
-  // --- evidence table ----------------------------------------------------
-  const meta = result.metadata || {}
-  const ela = result.ela || null
   const fp = result.fingerprint || {}
   const aspect = fp.aspect || {}
   const colour = fp.colour || {}
-  const rows = [
-    ['File', result.filename || '—'],
-    ['SHA-256', fp.sha256 || 'not computed'],
-    ['Type / size', `${result.content_type || '—'} · ${fmtBytes(result.size_bytes)}`],
-    [
-      'Dimensions',
-      result.dimensions
-        ? `${result.dimensions.width} x ${result.dimensions.height} px${fp.megapixels ? ` · ${fp.megapixels} MP` : ''}`
-        : '—',
-    ],
-    [
-      'Aspect ratio',
-      aspect.simplified
-        ? `${aspect.simplified}${aspect.name ? ` (${aspect.name})` : ''} · ${aspect.orientation}`
-        : '—',
-    ],
-    [
-      'Colour balance',
-      colour.mean_rgb
-        ? `mean RGB ${colour.mean_rgb.r} / ${colour.mean_rgb.g} / ${colour.mean_rgb.b}` +
-          (colour.channel_balance
-            ? `  ·  R ${(colour.channel_balance.r * 100).toFixed(1)}% G ${(colour.channel_balance.g * 100).toFixed(1)}% B ${(colour.channel_balance.b * 100).toFixed(1)}%`
-            : '')
-        : '—',
-    ],
-    ['Analysis model', result.model || '—'],
-    ['Metadata verdict', `${meta.verdict || '—'}${meta.confidence ? ` (confidence: ${meta.confidence})` : ''}`],
-    ['C2PA manifest', meta.c2pa?.present ? 'Present — NOT cryptographically validated' : 'None found'],
-    ['Generator signature', meta.ai_signatures?.length ? meta.ai_signatures.map((s) => s.label).join(', ') : 'None found'],
-    ['Editing software', meta.editing_software?.length ? meta.editing_software.join(', ') : 'None recorded'],
-    ['ELA signal', ela ? `${ela.interpretation?.signal ?? '—'} (mean error ${ela.metrics?.mean_error ?? '—'})` : 'Not run'],
-    ['Verification', `${result.prelint?.status ?? '—'} · ${result.prelint?.total ?? 0} finding(s)`],
-  ]
+  const meta = result.metadata || {}
+  const ela = result.ela || null
+  const verdict = report.verdict || 'inconclusive'
+  const score = Number.isFinite(report.integrity_score) ? report.integrity_score : null
 
-  doc.setDrawColor(...INK.rule).setLineWidth(0.5)
-  doc.line(M, y, W - M, y)
-  y += 16
-  doc.setFontSize(10)
-  for (const [label, value] of rows) {
-    doc.setFont('helvetica', 'bold').setTextColor(...INK.muted)
-    doc.text(label, M, y)
-    doc.setFont('helvetica', 'normal').setTextColor(...INK.body)
-    const lines = doc.splitTextToSize(String(value), W - M - 176)
-    doc.text(lines, M + 136, y)
-    y += Math.max(15, lines.length * 12 + 3)
-  }
-
-  y += 4
-  doc.setDrawColor(...INK.rule)
-  doc.line(M, y, W - M, y)
-  y += 20
-
-  const section = (title) => {
-    // Only needs room for the heading plus a line or two; bullets() re-checks
-    // per item, so a tighter bound here just avoids stranding a third of a page.
-    if (y > H - 96) {
-      doc.addPage()
-      y = M + 8
-    }
-    doc.setFont('helvetica', 'bold').setFontSize(11).setTextColor(...INK.body)
-    doc.text(title, M, y)
-    y += 15
-    doc.setFont('helvetica', 'normal').setFontSize(9.5)
-  }
-
-  // Hanging indent: the bullet sits in its own gutter and wrapped lines align
-  // under the text, not back at the margin.
-  const BULLET_GUTTER = 12
-
-  const bullet = (text, left, width, lineHeight = 12) => {
-    const lines = doc.splitTextToSize(String(text), width - BULLET_GUTTER)
-    doc.text('\u2022', left, y)
-    doc.text(lines, left + BULLET_GUTTER, y)
-    y += lines.length * lineHeight + 4
-  }
-
-  const bullets = (items, empty) => {
-    if (!items || items.length === 0) {
-      doc.setTextColor(...INK.muted)
-      doc.text(empty, M + 8, y)
-      y += 16
-      return
-    }
-    doc.setTextColor(...INK.body)
-    for (const item of items) {
-      if (y > H - 90) {
-        doc.addPage()
-        y = M + 8
-      }
-      bullet(item, M + 8, W - 2 * M - 8)
-    }
-    y += 6
-  }
-
-  // Dominant colour swatches: a compact visual the eye can match against the image.
-  if (colour.dominant?.length) {
-    section('Dominant colours by area')
-    const sw = 54
-    const gap = 10
-    let x = M
-    doc.setFontSize(7.5)
-    for (const c of colour.dominant.slice(0, 5)) {
-      const [r, g, b] = c.rgb || [0, 0, 0]
-      doc.setFillColor(r, g, b)
-      doc.setDrawColor(...INK.rule)
-      doc.roundedRect(x, y, sw, 26, 3, 3, 'FD')
-      doc.setTextColor(...INK.muted)
-      doc.text(c.hex, x, y + 36)
-      doc.text(`${(c.share * 100).toFixed(1)}%`, x, y + 45)
-      x += sw + gap
-    }
-    y += 72 // clear of the swatch captions before the next section heading
-  }
-
-  // Embedded renders. Generous padding below the images keeps their captions
-  // clear of whatever section lands next.
   const [origImg, elaImg] = await Promise.all([
     toBoundedImage(originalSrc),
     toBoundedImage(ela?.heatmap),
   ])
-  if (origImg || elaImg) {
-    if (y > H - 260) {
-      doc.addPage()
-      y = M + 8
-    }
-    section('Visual record')
-    const slot = (W - 2 * M - 20) / 2
-    const boxH = 150
-    const drawImage = (img, left, caption) => {
-      doc.setDrawColor(...INK.rule)
-      doc.setFillColor(248, 250, 252)
-      doc.roundedRect(left, y, slot, boxH, 4, 4, 'FD')
-      if (img) {
-        const pad = 10
-        const scale = Math.min((slot - pad * 2) / img.width, (boxH - pad * 2) / img.height)
-        const w = img.width * scale
-        const h = img.height * scale
-        doc.addImage(img.dataUrl, 'JPEG', left + (slot - w) / 2, y + (boxH - h) / 2, w, h)
-      } else {
-        // An empty frame reads as a rendering fault; say what happened instead.
-        doc.setFontSize(8).setTextColor(...INK.muted)
-        doc.text('Image not available', left + slot / 2, y + boxH / 2, { align: 'center' })
-      }
-      doc.setFontSize(8).setTextColor(...INK.muted)
-      doc.text(caption, left + slot / 2, y + boxH + 13, { align: 'center' })
-    }
-    drawImage(origImg, M, 'Original')
-    drawImage(elaImg, M + slot + 20, 'ELA heatmap')
-    y += boxH + 26
-    doc.setFontSize(7.5).setTextColor(...INK.muted)
-    doc.text(
-      'Downscaled visual references. The SHA-256 above identifies the analysed bytes.',
-      M, y,
-    )
-    y += 18
-  }
 
-  section('Summary')
-  doc.setTextColor(...INK.body)
-  const summary = doc.splitTextToSize(report.summary || 'No summary was produced.', W - 2 * M)
-  doc.text(summary, M, y)
-  y += summary.length * 12 + 12
-
-  section('Detected indicators')
-  bullets(
-    [...(report.tampering_detection?.indicators || []), ...(report.model_signature?.signature_evidence || [])],
-    'No specific indicators were recorded.',
-  )
-
-  section('Verification findings')
-  bullets(
-    (result.prelint?.findings || []).map((f) => `[${f.severity}] ${f.stage} · ${f.code}: ${f.detail}`),
-    'No verification findings — model output matched the expected schema and the local evidence.',
-  )
-
-  // --- limitations -------------------------------------------------------
-  if (y > H - 150) {
-    doc.addPage()
-    y = M + 8
-  }
-  doc.setFillColor(248, 250, 252)
-  doc.setDrawColor(...INK.rule)
-  const boxTop = y - 4
-  doc.setFont('helvetica', 'bold').setFontSize(10).setTextColor(...INK.body)
-  const limitations = [
-    'This certificate records automated analysis, not a legal or expert determination.',
-    'Metadata is trivially forged and is stripped by most platforms on upload, so its absence proves nothing.',
-    'Any C2PA manifest reported here was detected but NOT cryptographically validated.',
-    'Error Level Analysis is a visual aid only. Texture and re-saving raise error without editing, and an edit re-saved at the same quality leaves no trace.',
+  // ---- footer first: it is fixed, and everything else budgets around it ----
+  const LIMITATIONS = [
+    'Automated analysis, not a legal or expert determination.',
+    'Metadata is trivially forged and stripped by most platforms on upload — its absence proves nothing.',
+    'Any C2PA manifest was detected but NOT cryptographically validated.',
+    'ELA is a visual aid only; texture and re-saving raise error without editing.',
     'The visual assessment comes from a general-purpose language model and can be confidently wrong.',
   ]
-  const LIM_WIDTH = W - 2 * M - 24 - BULLET_GUTTER
-  // Measure at the size the text will actually be drawn at, or the box will
-  // not match its contents.
-  doc.setFont('helvetica', 'normal').setFontSize(8.5)
-  const wrapped = limitations.map((t) => doc.splitTextToSize(t, LIM_WIDTH))
-  const boxHeight = 34 + wrapped.reduce((n, l) => n + l.length * 11 + 5, 0)
-  doc.setFont('helvetica', 'bold').setFontSize(10).setTextColor(...INK.body)
-  doc.roundedRect(M, boxTop, W - 2 * M, boxHeight, 5, 5, 'FD')
-  doc.text('Limitations', M + 12, y + 14)
-  y += 30
-  doc.setFont('helvetica', 'normal').setFontSize(8.5).setTextColor(...INK.muted)
-  for (const lines of wrapped) {
-    doc.text('\u2022', M + 12, y)
-    doc.text(lines, M + 12 + BULLET_GUTTER, y)
-    y += lines.length * 11 + 5
+  doc.setFont('helvetica', 'normal').setFontSize(7)
+  const limLines = LIMITATIONS.map((t) => doc.splitTextToSize(t, PAGE.W - 2 * MX - 34))
+  const limBodyH = limLines.reduce((n, l) => n + l.length * 8, 0)
+  const FOOTER_H = 16 + limBodyH + 12          // title + body + credit line
+  const FOOTER_TOP = PAGE.H - MY - FOOTER_H
+  const CONTENT_BOTTOM = FOOTER_TOP - 8        // hard ceiling for flowing content
+
+  let y = 0
+
+  // ---- header band ----
+  doc.setFillColor(11, 14, 23)
+  doc.rect(0, 0, PAGE.W, 52, 'F')
+  doc.setTextColor(...INK.heading).setFont('helvetica', 'bold').setFontSize(15)
+  doc.text('PixelGuard', MX, 25)
+  const brandW = doc.getTextWidth('PixelGuard')
+  doc.setTextColor(...ACCENT)
+  doc.text('Forensic Certificate', MX + brandW + 9, 25)
+  doc.setFont('helvetica', 'normal').setFontSize(7.5).setTextColor(150, 165, 185)
+  doc.text('AI Asset Provenance & Forensics Engine', MX, 38)
+  doc.text(`Issued ${fmtStamp(issued)}`, PAGE.W - MX, 38, { align: 'right' })
+  y = 52 + 14
+
+  // ---- verdict strip ----
+  const vc = VERDICT_COLOR[verdict] || VERDICT_COLOR.inconclusive
+  doc.setFillColor(...vc)
+  doc.roundedRect(MX, y, 132, 26, 5, 5, 'F')
+  doc.setTextColor(255, 255, 255).setFont('helvetica', 'bold').setFontSize(11)
+  doc.text(VERDICT_LABEL[verdict] || 'Inconclusive', MX + 11, y + 17.5)
+
+  doc.setTextColor(...INK.body).setFont('helvetica', 'normal').setFontSize(9.5)
+  const scoreTxt = `Integrity ${score === null ? '—' : `${score}/100`}`
+  const confTxt = Number.isFinite(report.confidence) ? `Confidence ${report.confidence}%` : 'Confidence —'
+  const lintTxt = `Verification: ${result.prelint?.status ?? '—'} (${result.prelint?.total ?? 0})`
+  doc.text(scoreTxt, MX + 146, y + 11)
+  doc.text(confTxt, MX + 146, y + 22)
+  doc.text(lintTxt, MX + 300, y + 11)
+  doc.text(`Model: ${result.model || '—'}`, MX + 300, y + 22)
+  y += 26 + 12
+
+  // ---- structural fingerprint: 3-column micro-grid ----
+  const label = (t, x, yy) => {
+    doc.setFont('helvetica', 'bold').setFontSize(6.5).setTextColor(...INK.faint)
+    doc.text(t.toUpperCase(), x, yy)
+  }
+  const value = (t, x, yy, w) => {
+    doc.setFont('helvetica', 'normal').setFontSize(8).setTextColor(...INK.body)
+    doc.text(doc.splitTextToSize(String(t ?? '—'), w)[0] || '—', x, yy)
   }
 
-  // --- footer on every page ---------------------------------------------
-  const pages = doc.getNumberOfPages()
-  for (let p = 1; p <= pages; p += 1) {
-    doc.setPage(p)
-    doc.setFont('helvetica', 'normal').setFontSize(8).setTextColor(...INK.muted)
-    doc.text(`PixelGuard forensic certificate · issued ${issued.toISOString()}`, M, H - 26)
-    doc.text(`Page ${p} of ${pages}`, W - M, H - 26, { align: 'right' })
+  doc.setDrawColor(...INK.rule).setLineWidth(0.5)
+  doc.line(MX, y, PAGE.W - MX, y)
+  y += 12
+
+  const colW = (PAGE.W - 2 * MX) / 3
+  const cells = [
+    ['File', result.filename],
+    ['Type / size', `${result.content_type || '—'} · ${fmtBytes(result.size_bytes)}`],
+    ['Dimensions', result.dimensions ? `${result.dimensions.width}×${result.dimensions.height} px${fp.megapixels ? ` · ${fp.megapixels} MP` : ''}` : '—'],
+    ['Aspect', aspect.simplified ? `${aspect.simplified}${aspect.name ? ` (${aspect.name})` : ''}` : '—'],
+    ['Mean RGB', colour.mean_rgb ? `${colour.mean_rgb.r} / ${colour.mean_rgb.g} / ${colour.mean_rgb.b}` : '—'],
+    ['RGB balance', colour.channel_balance ? `R ${(colour.channel_balance.r * 100).toFixed(0)}%  G ${(colour.channel_balance.g * 100).toFixed(0)}%  B ${(colour.channel_balance.b * 100).toFixed(0)}%` : '—'],
+    ['Metadata', `${meta.verdict || '—'}${meta.confidence ? ` (${meta.confidence})` : ''}`],
+    ['C2PA', meta.c2pa?.present ? 'Present — unvalidated' : 'None found'],
+    ['Generator', meta.ai_signatures?.length ? meta.ai_signatures.map((x) => x.label).join(', ') : 'None found'],
+  ]
+  cells.forEach(([k, v], i) => {
+    const col = i % 3
+    const row = Math.floor(i / 3)
+    const x = MX + col * colW
+    const yy = y + row * 26
+    label(k, x, yy)
+    value(v, x, yy + 10, colW - 10)
+  })
+  y += Math.ceil(cells.length / 3) * 26 + 2
+
+  // SHA-256 spans the full width: it must never wrap or be clipped.
+  label('SHA-256', MX, y)
+  doc.setFont('courier', 'normal').setFontSize(7.4).setTextColor(...INK.body)
+  doc.text(fp.sha256 || 'not computed', MX, y + 10)
+  y += 20
+
+  // ---- visual record + dominant colours, one row ----
+  doc.setDrawColor(...INK.rule)
+  doc.line(MX, y, PAGE.W - MX, y)
+  y += 12
+
+  const THUMB = 60
+  const drawThumb = (img, x, caption) => {
+    doc.setDrawColor(...INK.rule).setFillColor(...INK.panel)
+    doc.roundedRect(x, y, THUMB, THUMB, 3, 3, 'FD')
+    // Guard on the payload, not just the wrapper: an encoder that returns a
+    // null data URI would otherwise reach addImage() and throw.
+    if (img?.dataUrl) {
+      // Fit inside the square: any aspect ratio lands within the frame, so a
+      // panorama or a tall portrait can never push the layout around.
+      const pad = 4
+      const s = Math.min((THUMB - pad * 2) / img.width, (THUMB - pad * 2) / img.height)
+      const w = img.width * s
+      const h = img.height * s
+      doc.addImage(img.dataUrl, 'JPEG', x + (THUMB - w) / 2, y + (THUMB - h) / 2, w, h)
+    } else {
+      doc.setFont('helvetica', 'normal').setFontSize(6).setTextColor(...INK.faint)
+      doc.text('n/a', x + THUMB / 2, y + THUMB / 2, { align: 'center' })
+    }
+    doc.setFont('helvetica', 'normal').setFontSize(6.5).setTextColor(...INK.muted)
+    doc.text(caption, x + THUMB / 2, y + THUMB + 8, { align: 'center' })
   }
+  drawThumb(origImg, MX, 'Original')
+  drawThumb(elaImg, MX + THUMB + 10, 'ELA heatmap')
+
+  // swatches to the right of the thumbnails
+  if (colour.dominant?.length) {
+    const sx = MX + 2 * THUMB + 26
+    label('Dominant colours by area', sx, y + 6)
+    let cx = sx
+    for (const c of colour.dominant.slice(0, 5)) {
+      const [r, g, b] = c.rgb || [0, 0, 0]
+      doc.setFillColor(r, g, b).setDrawColor(...INK.rule)
+      doc.roundedRect(cx, y + 12, 34, 20, 2, 2, 'FD')
+      doc.setFont('courier', 'normal').setFontSize(6).setTextColor(...INK.muted)
+      doc.text(c.hex, cx, y + 40)
+      doc.text(`${(c.share * 100).toFixed(1)}%`, cx, y + 48)
+      cx += 40
+    }
+    if (ela?.interpretation?.signal) {
+      doc.setFont('helvetica', 'normal').setFontSize(7).setTextColor(...INK.muted)
+      doc.text(
+        `ELA: ${ela.interpretation.signal} · mean error ${ela.metrics?.mean_error ?? '—'}`,
+        sx, y + 62,
+      )
+    }
+  }
+  y += THUMB + 18
+
+  // ---- combined summary + indicators ----
+  doc.setDrawColor(...INK.rule)
+  doc.line(MX, y, PAGE.W - MX, y)
+  y += 12
+
+  const indicators = [
+    ...(report.tampering_detection?.indicators || []),
+    ...(report.model_signature?.signature_evidence || []),
+  ]
+  const innerW = PAGE.W - 2 * MX - 20
+  doc.setFont('helvetica', 'normal').setFontSize(8.2)
+  const summaryLines = doc.splitTextToSize(report.summary || 'No summary was produced.', innerW)
+
+  // Budget: leave room for the findings block below.
+  const indicatorLines = indicators.map((t) => doc.splitTextToSize(t, innerW - 10))
+  let boxH = 26 + summaryLines.length * 9.6
+  const shownIndicators = []
+  for (let i = 0; i < indicatorLines.length; i += 1) {
+    const add = indicatorLines[i].length * 9.2
+    if (y + boxH + add + 14 > CONTENT_BOTTOM - 60) break
+    boxH += add
+    shownIndicators.push(indicatorLines[i])
+  }
+  if (indicators.length) boxH += 14 // sub-heading
+  const droppedIndicators = indicators.length - shownIndicators.length
+  if (droppedIndicators > 0) boxH += 10
+
+  doc.setFillColor(...INK.panel).setDrawColor(...INK.rule)
+  doc.roundedRect(MX, y, PAGE.W - 2 * MX, boxH, 4, 4, 'FD')
+  let by = y + 14
+  doc.setFont('helvetica', 'bold').setFontSize(8).setTextColor(...INK.body)
+  doc.text('Summary', MX + 10, by)
+  by += 11
+  doc.setFont('helvetica', 'normal').setFontSize(8.2).setTextColor(...INK.body)
+  doc.text(summaryLines, MX + 10, by)
+  by += summaryLines.length * 9.6 + 4
+
+  if (indicators.length) {
+    doc.setFont('helvetica', 'bold').setFontSize(8).setTextColor(...INK.body)
+    doc.text('Detected indicators', MX + 10, by)
+    by += 10
+    doc.setFont('helvetica', 'normal').setFontSize(7.8).setTextColor(...INK.muted)
+    for (const lines of shownIndicators) {
+      doc.text('•', MX + 10, by)
+      doc.text(lines, MX + 20, by)
+      by += lines.length * 9.2
+    }
+    if (droppedIndicators > 0) {
+      doc.setFont('helvetica', 'italic').setFontSize(7)
+      doc.text(`+${droppedIndicators} more in the full report`, MX + 20, by)
+    }
+  }
+  y += boxH + 12
+
+  // ---- verification findings, truncated to fit ----
+  const findings = result.prelint?.findings || []
+  doc.setFont('helvetica', 'bold').setFontSize(8).setTextColor(...INK.body)
+  if (y + 22 < CONTENT_BOTTOM) {
+    doc.text('Verification findings', MX, y)
+    y += 11
+    doc.setFont('helvetica', 'normal').setFontSize(7.6).setTextColor(...INK.muted)
+    if (!findings.length) {
+      doc.text('None — model output matched the expected schema and the local evidence.', MX, y)
+      y += 10
+    } else {
+      let drawn = 0
+      for (const f of findings) {
+        const lines = doc.splitTextToSize(`[${f.severity}] ${f.stage} · ${f.code}: ${f.detail}`, PAGE.W - 2 * MX - 12)
+        if (y + lines.length * 8.6 > CONTENT_BOTTOM - 8) break
+        doc.text('•', MX, y)
+        doc.text(lines, MX + 10, y)
+        y += lines.length * 8.6 + 1.5
+        drawn += 1
+      }
+      if (drawn < findings.length) {
+        doc.setFont('helvetica', 'italic').setFontSize(7)
+        doc.text(`+${findings.length - drawn} more finding(s) in the full report`, MX + 10, y)
+      }
+    }
+  }
+
+  // ---- limitations block, 7pt ----
+  // Pinned to the bottom on a full report, but floated up to follow the content
+  // on a light one: a certificate with 400pt of dead space in the middle reads
+  // as broken rather than formal. The budget above guarantees content always
+  // ends above FOOTER_TOP, so this can only move the block upward.
+  const limTop = Math.min(y + 14, FOOTER_TOP)
+  doc.setFillColor(...INK.panel).setDrawColor(...INK.rule)
+  doc.roundedRect(MX, limTop, PAGE.W - 2 * MX, FOOTER_H - 10, 4, 4, 'FD')
+  doc.setFont('helvetica', 'bold').setFontSize(7).setTextColor(...INK.body)
+  doc.text('Limitations', MX + 10, limTop + 11)
+  doc.setFont('helvetica', 'normal').setFontSize(7).setTextColor(...INK.muted)
+  let fy = limTop + 21
+  for (const lines of limLines) {
+    doc.text('•', MX + 10, fy)
+    doc.text(lines, MX + 20, fy)
+    fy += lines.length * 8
+  }
+  doc.setFontSize(6.5).setTextColor(...INK.faint)
+  doc.text(`PixelGuard · issued ${issued.toISOString()}`, MX, PAGE.H - MY - 2)
+  doc.text('Page 1 of 1', PAGE.W - MX, PAGE.H - MY - 2, { align: 'right' })
 
   return doc
 }

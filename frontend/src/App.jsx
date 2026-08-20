@@ -3,6 +3,7 @@ import {
   ShieldCheck, ShieldAlert, ShieldQuestion, UploadCloud, ScanSearch, Loader2,
   ImageIcon, Fingerprint, Cpu, FileWarning, Activity, FileText, Layers,
   FileSearch, CheckCircle2, AlertTriangle, Info, X, RotateCcw, Hash,
+  Link2, ClipboardCopy, Check,
 } from 'lucide-react'
 import CompareSlider from './components/CompareSlider.jsx'
 import SampleGallery from './components/SampleGallery.jsx'
@@ -275,8 +276,10 @@ function PrelintPanel({ prelint }) {
   )
 }
 
-function AnalysisPanel({ loading, error, result }) {
-  if (loading) {
+function AnalysisPanel({ loading, error, result, evidence }) {
+  // Local evidence arrives in well under a second; only the model verdict waits.
+  const shown = result || evidence
+  if (loading && !shown) {
     return (
       <div className="panel flex min-h-[340px] flex-col items-center justify-center gap-5 p-8">
         <div className="relative">
@@ -303,7 +306,7 @@ function AnalysisPanel({ loading, error, result }) {
     )
   }
 
-  if (!result) {
+  if (!shown) {
     return (
       <div className="panel flex min-h-[340px] flex-col items-center justify-center gap-4 p-8 text-center">
         <ScanSearch size={34} className="text-faint" />
@@ -315,7 +318,8 @@ function AnalysisPanel({ loading, error, result }) {
     )
   }
 
-  const report = result.report || {}
+  const report = result?.report || {}
+  const modelPending = !result && loading
   const verdict = VERDICT_STYLES[report.verdict] || VERDICT_STYLES.inconclusive
   const VerdictIcon = verdict.icon
   const score = Number.isFinite(report.integrity_score) ? report.integrity_score : null
@@ -327,21 +331,26 @@ function AnalysisPanel({ loading, error, result }) {
     <div className="flex flex-col gap-4">
       <div className="panel flex flex-wrap items-center justify-between gap-3 p-5">
         <div className="flex min-w-0 items-center gap-4">
-          <div className={`shrink-0 rounded-xl border p-3 ${verdict.tone}`}>
-            <VerdictIcon size={22} />
+          <div className={`shrink-0 rounded-xl border p-3 ${modelPending ? TONE.neutral : verdict.tone}`}>
+            {modelPending ? <Loader2 size={22} className="animate-spin" /> : <VerdictIcon size={22} />}
           </div>
           <div className="min-w-0">
             <p className="text-[10px] uppercase tracking-widest text-faint">Verdict</p>
-            <p className="break-anywhere text-lg font-semibold text-fg">Status: {verdict.label}</p>
+            <p className="break-anywhere text-lg font-semibold text-fg">
+              {modelPending ? 'Awaiting model analysis…' : `Status: ${verdict.label}`}
+            </p>
           </div>
         </div>
-        {Number.isFinite(report.confidence) && (
+        {modelPending ? (
+          <Badge className={TONE.neutral}>local evidence ready</Badge>
+        ) : Number.isFinite(report.confidence) ? (
           <Badge className={TONE.neutral}>
             <Activity size={12} /> {report.confidence}% confidence
           </Badge>
-        )}
+        ) : null}
       </div>
 
+      {!modelPending && (
       <div className="panel flex flex-col gap-6 p-5 sm:flex-row sm:items-center">
         {score !== null && <ScoreRing score={score} />}
         <div className="flex min-w-0 flex-1 flex-col gap-3">
@@ -369,6 +378,7 @@ function AnalysisPanel({ loading, error, result }) {
           </div>
         </div>
       </div>
+      )}
 
       {report.summary && (
         <div className="panel p-5">
@@ -377,9 +387,9 @@ function AnalysisPanel({ loading, error, result }) {
         </div>
       )}
 
-      <FingerprintPanel fingerprint={result.fingerprint} />
-      <MetadataPanel metadata={result.metadata} />
-      <PrelintPanel prelint={result.prelint} />
+      <FingerprintPanel fingerprint={shown.fingerprint} />
+      <MetadataPanel metadata={shown.metadata} />
+      <PrelintPanel prelint={result?.prelint} />
 
       {indicators.length > 0 && (
         <div className="panel p-5">
@@ -400,7 +410,7 @@ function AnalysisPanel({ loading, error, result }) {
           Raw JSON Payload
         </summary>
         <pre className="mt-3 max-h-72 overflow-auto rounded-xl bg-raised p-4 font-mono text-xs leading-relaxed text-muted">
-          {JSON.stringify(result, null, 2)}
+          {JSON.stringify(result || shown, null, 2)}
         </pre>
       </details>
     </div>
@@ -415,7 +425,11 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [result, setResult] = useState(null)
+  const [evidence, setEvidence] = useState(null)   // local-only, paints first
   const [certifying, setCertifying] = useState(false)
+  const [urlInput, setUrlInput] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   // Object URLs are revoked when replaced or cleared (below) but deliberately
   // NOT on unmount: React Fast Refresh and StrictMode both remount components
@@ -435,6 +449,7 @@ export default function App() {
     })
     setFile(picked)
     setResult(null)
+    setEvidence(null)
     setError(null)
   }, [])
 
@@ -445,6 +460,7 @@ export default function App() {
     })
     setFile(null)
     setResult(null)
+    setEvidence(null)
     setError(null)
   }, [])
 
@@ -453,14 +469,39 @@ export default function App() {
     setLoading(true)
     setError(null)
     setResult(null)
+    setEvidence(null)
+
+    const body = () => {
+      const fd = new FormData()
+      fd.append('file', file)
+      return fd
+    }
+
+    // Two requests in flight at once. The local pass returns hashes, metadata
+    // and the ELA heatmap in well under a second so the panel is populated
+    // immediately; the full pass carries the model verdict and replaces it.
+    // include_ela=false on the full pass avoids recomputing a heatmap we
+    // already have.
+    const localCall = fetch(`${API_URL}/api/v1/analyze/local`, { method: 'POST', body: body() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) setEvidence(d) })
+      .catch(() => {}) // best-effort: the full pass is the one that must succeed
+
+    const fullBody = body()
+    if (prompt.trim()) fullBody.append('prompt', prompt.trim())
+    fullBody.append('include_ela', 'false')
+
     try {
-      const formData = new FormData()
-      formData.append('file', file)
-      if (prompt.trim()) formData.append('prompt', prompt.trim())
-      const res = await fetch(`${API_URL}/api/v1/forensics/analyze`, { method: 'POST', body: formData })
+      const res = await fetch(`${API_URL}/api/v1/forensics/analyze`, { method: 'POST', body: fullBody })
       const data = await res.json().catch(() => null)
       if (!res.ok) throw new Error(data?.detail || `Request failed with status ${res.status}`)
-      setResult(data)
+      await localCall
+      // The full response omits the heatmap it was told not to compute, so
+      // carry the local one across.
+      setEvidence((local) => {
+        setResult({ ...data, ela: data.ela || local?.ela || null })
+        return local
+      })
     } catch (err) {
       setError(
         err.message === 'Failed to fetch'
@@ -469,6 +510,49 @@ export default function App() {
       )
     } finally {
       setLoading(false)
+    }
+  }
+
+  const importFromUrl = async () => {
+    const url = urlInput.trim()
+    if (!url || importing) return
+    setImporting(true)
+    setError(null)
+    try {
+      const fd = new FormData()
+      fd.append('url', url)
+      const res = await fetch(`${API_URL}/api/v1/fetch-url`, { method: 'POST', body: fd })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(data?.detail || `Import failed (${res.status})`)
+      const blob = await (await fetch(data.data_uri)).blob()
+      applyFile(new File([blob], data.filename, { type: blob.type }))
+      setUrlInput('')
+    } catch (err) {
+      setError(
+        err.message === 'Failed to fetch'
+          ? `Could not reach the backend at ${API_URL}.`
+          : err.message,
+      )
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const copyPayload = async () => {
+    const payload = result || evidence
+    if (!payload) return
+    // The heatmap is a ~400 KB data URI; nobody wants that on their clipboard.
+    const { ela, ...rest } = payload
+    const slim = {
+      ...rest,
+      ela: ela ? { ...ela, heatmap: '[omitted — base64 PNG, see the app]' } : null,
+    }
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(slim, null, 2))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    } catch {
+      setError('Clipboard blocked by the browser. Use the Raw JSON panel instead.')
     }
   }
 
@@ -499,17 +583,28 @@ export default function App() {
               Pixel<span className="text-accent">Guard</span>
             </h1>
             <p className="truncate text-xs text-muted">AI Asset Provenance &amp; Forensics Engine</p>
+            <div className="mt-1 hidden flex-wrap items-center gap-1 sm:flex">
+              {['FastAPI', 'Gemini Vision', 'Pillow + NumPy', 'C2PA / EXIF', 'Vercel'].map((t) => (
+                <span key={t} className="rounded border border-line bg-raised px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-faint">
+                  {t}
+                </span>
+              ))}
+            </div>
           </div>
         </div>
 
-        {/* Single control strip: model, reset, export, theme. */}
+        {/* Single control strip: model, copy, reset, export, theme. */}
         <div className="flex min-w-0 flex-wrap items-center gap-1.5 rounded-xl border border-line bg-card p-1.5">
           <span
             className="hidden max-w-[150px] truncate px-2 font-mono text-[11px] text-faint sm:inline"
-            title={result?.model || 'gemini-pro-latest'}
+            title={result?.model || 'gemini-flash-latest'}
           >
-            {result?.model || 'gemini-pro-latest'}
+            {result?.model || 'gemini-flash-latest'}
           </span>
+          <button onClick={copyPayload} disabled={!result && !evidence} className={controlBtn} title="Copy the analysis payload as JSON">
+            {copied ? <Check size={13} /> : <ClipboardCopy size={13} />}
+            <span className="hidden sm:inline">{copied ? 'Copied' : 'Copy JSON'}</span>
+          </button>
           <button onClick={handleClear} disabled={!file || loading} className={controlBtn} title="Clear the selected image">
             <RotateCcw size={13} /> <span className="hidden sm:inline">Reset</span>
           </button>
@@ -530,6 +625,29 @@ export default function App() {
           <SampleGallery onPick={applyFile} disabled={loading} />
           <UploadZone file={file} previewUrl={previewUrl} onFile={applyFile} onClear={handleClear} loading={loading} />
 
+          {/* Fetched server-side: the browser cannot read cross-origin images,
+              and the backend restricts this to public addresses (no SSRF). */}
+          <div className="panel flex min-w-0 items-center gap-2 p-2">
+            <Link2 size={15} className="ml-1 shrink-0 text-accent" />
+            <input
+              type="url"
+              value={urlInput}
+              onChange={(e) => setUrlInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') importFromUrl() }}
+              placeholder="Paste an image URL to analyse…"
+              disabled={loading || importing}
+              className="min-w-0 flex-1 bg-transparent px-1 py-1.5 text-sm text-fg placeholder:text-faint focus:outline-none"
+            />
+            <button
+              onClick={importFromUrl}
+              disabled={!urlInput.trim() || loading || importing}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-raised px-3 py-1.5 text-xs font-medium text-muted transition-colors hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {importing ? <Loader2 size={13} className="animate-spin" /> : <Link2 size={13} />}
+              {importing ? 'Fetching…' : 'Import'}
+            </button>
+          </div>
+
           <input
             type="text" value={prompt} onChange={(e) => setPrompt(e.target.value)}
             placeholder="Optional analyst instructions (e.g. focus on face region)…"
@@ -544,13 +662,13 @@ export default function App() {
             {loading ? (<><Loader2 size={18} className="animate-spin" /> Analyzing…</>) : (<><ScanSearch size={18} /> Run Forensics</>)}
           </button>
 
-          {result?.ela?.heatmap && previewUrl && (
+          {(result?.ela || evidence?.ela)?.heatmap && previewUrl && (
             <div className="panel p-5">
               <SectionLabel icon={Layers}>Error Level Analysis</SectionLabel>
-              <CompareSlider original={previewUrl} heatmap={result.ela.heatmap} alt={result.filename} />
-              <p className="mt-3 break-anywhere text-xs leading-relaxed text-muted">{result.ela.interpretation?.note}</p>
+              <CompareSlider original={previewUrl} heatmap={(result?.ela || evidence?.ela).heatmap} alt={file?.name} />
+              <p className="mt-3 break-anywhere text-xs leading-relaxed text-muted">{(result?.ela || evidence?.ela)?.interpretation?.note}</p>
               <p className="mt-2 break-anywhere text-xs leading-relaxed text-amber-700 dark:text-amber-300/80">
-                {result.ela.interpretation?.caveat}
+                {(result?.ela || evidence?.ela)?.interpretation?.caveat}
               </p>
             </div>
           )}
@@ -560,12 +678,12 @@ export default function App() {
           <div className="flex items-center gap-2 text-sm font-medium text-muted">
             <Fingerprint size={16} className="text-accent" /> Forensic Report
           </div>
-          <AnalysisPanel loading={loading} error={error} result={result} />
+          <AnalysisPanel loading={loading} error={error} result={result} evidence={evidence} />
         </section>
       </main>
 
       <footer className="mt-10 break-anywhere border-t border-line pt-5 text-center font-mono text-xs text-faint">
-        PixelGuard v0.4.0 · local analysis node · {API_URL}
+        PixelGuard v0.5.0 · local analysis node · {API_URL}
       </footer>
     </div>
   )
