@@ -22,9 +22,9 @@ const SAMPLES = [
   {
     id: 'camera',
     file: '/samples/authentic-camera.jpg',
-    name: 'Camera capture',
-    detail: 'Carries plausible capture EXIF (body, lens, exposure, GPS).',
-    expect: 'Metadata parser should report camera capture indicators.',
+    name: 'Camera EXIF',
+    detail: 'Procedurally drawn, then given full capture EXIF (body, lens, exposure, GPS).',
+    expect: 'EXIF is read as camera capture while the visual read declines to call a drawing a photograph — the disagreement is reported, not resolved.',
     tone: 'text-emerald-700 dark:text-emerald-300 border-emerald-600/30 dark:border-emerald-500/30 bg-emerald-500/10',
   },
   {
