@@ -12,10 +12,12 @@ Tags: python, fastapi, pytorch, opencv, gemini-api, c2pa, provenance, ai-securit
 | | |
 | --- | --- |
 | **Live app** | **https://pixel-guard-ai-nine.vercel.app/** |
+| **Demo video** | **https://www.youtube.com/watch?v=q8cCbT4KbTE** |
+| **Devpost submission** | https://devpost.com/software/pixelguard-ai-asset-provenance-forensics-engine |
 | **Backend health** | https://pixelguard-ai.onrender.com/api/v1/health |
 | **API docs** | https://pixelguard-ai.onrender.com/docs |
 
-[▶ Watch the 3-minute demo](docs/pixelguard-demo.mp4) — 1280×720, 3:03, recorded against the deployed app, with narrated voiceover and on-screen captions.
+[▶ Watch the 3-minute demo on YouTube](https://www.youtube.com/watch?v=q8cCbT4KbTE) — 1280×720, 3:03, recorded against the deployed app, with narrated voiceover and on-screen captions. Built for the [Pixel Forge AI Hackathon](https://devpost.com/software/pixelguard-ai-asset-provenance-forensics-engine) on Devpost.
 
 A [sample forensic certificate](docs/sample-forensic-certificate.pdf) exported during that recording is included too.
 
