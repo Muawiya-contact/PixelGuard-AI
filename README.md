@@ -45,23 +45,49 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173, drop an image, and hit **Run Forensics**.
+Open http://localhost:5173, drop an image (or pick one from the **Sample gallery**), and hit **Run Forensics**.
+
+The frontend adds a draggable **original vs. ELA heatmap** comparison slider, a **Download Forensic Certificate** button that produces a PDF report of the findings and their limitations, and a **sample gallery** of procedurally generated fixtures — each carrying a crafted metadata or compression history so a specific detector can be seen firing against known ground truth. Those fixtures are synthetic, not photographs, and the UI says so.
+
+**Light and dark themes** follow the OS preference until you pick a side with the header toggle, after which the choice persists. Both are driven by semantic CSS variables (`--pg-bg`, `--pg-fg`, …) declared in `src/index.css`, so adding a theme means redefining tokens rather than editing components. An inline script in `index.html` applies the stored theme before first paint, avoiding a flash of the wrong background. Text contrast was measured in-browser against both palettes and meets WCAG AA (≥4.5:1) for body, secondary, and faint text.
 
 ## API Endpoints
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/` | Liveness check |
-| GET | `/api/v1/health` | API key + model configuration status |
-| POST | `/api/v1/forensics/analyze` | Multipart upload (`file`, optional `prompt`) → JSON forensic report |
-
-Example:
+| GET | `/api/v1/health` | API key, model and CORS configuration status |
+| POST | `/api/v1/forensics/analyze` | Full pass: metadata + ELA + model analysis + verification |
+| POST | `/api/v1/analyze/ela` | Error Level Analysis heatmap (local, no API key needed) |
+| POST | `/api/v1/analyze/metadata` | C2PA / EXIF / XMP parse (local, no API key needed) |
+| POST | `/api/v1/analyze/fingerprint` | SHA-256, geometry and colour statistics (local) |
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/forensics/analyze \
   -F "file=@sample.jpg" \
   -F "prompt=focus on lighting consistency"
 ```
+
+## Forensic pipeline
+
+A request to `/api/v1/forensics/analyze` runs these stages, in this order:
+
+1. **Metadata** (`backend/services/metadata.py`) — parses EXIF, PNG text chunks, XMP, and scans the raw container for C2PA markers and generator signatures (Stable Diffusion, ComfyUI, Midjourney, DALL·E, Firefly, Imagen/SynthID, FLUX, and others). Signatures found in parsed metadata are reported with higher confidence than ones found only in the raw container.
+
+2. **Error Level Analysis** (`backend/services/ela.py`) — re-encodes the image at a known JPEG quality and maps the per-pixel difference to a colour heatmap, returned as a base64 PNG. Implemented with Pillow + NumPy rather than OpenCV, which would add tens of megabytes to a container that cold-starts on a free tier.
+
+3. **Fingerprint** (`backend/services/fingerprint.py`) — SHA-256 and MD5 of the exact analysed bytes, plus dimensions, aspect-ratio breakdown, and dominant colours by area. Not a detector: it is the descriptive record that lets someone else confirm a certificate refers to the image in front of them.
+
+4. **Prelint** (`backend/services/prelint.py`) — verification on both sides of the model call. Inbound, the caller's free-text instructions are scanned for prompt-injection phrasing and neutralised before they reach Gemini. Outbound, the model's JSON is coerced to the expected schema, range-clamped, checked for self-contradiction, and reconciled against the metadata evidence. Every correction is reported in `prelint.findings` rather than applied silently.
+
+### What these detectors can and cannot tell you
+
+Honest limits matter more than an impressive verdict:
+
+- **Metadata is decisive when present and meaningless when absent.** A Stable Diffusion parameter block is close to proof of generation; no metadata at all is uninformative, because every major platform strips it on upload. It is also trivially forged.
+- **C2PA manifests are detected, not validated.** Verifying the signature chain needs the `c2pa` library and a trust list. An unvalidated manifest is a claim, not proof.
+- **ELA is a visualization, not a classifier.** Benchmarked here against composites with known ground truth, its tile statistics did **not** separate edited images from clean ones — untouched images with fine texture routinely score higher than spliced ones. It is shipped as a heatmap for a human to read, and deliberately makes no tampering claim. A skilled edit re-saved at the same quality leaves no ELA trace at all.
+- **The visual verdict comes from a general-purpose language model** and can be confidently wrong. Prelint exists precisely because that output cannot be trusted unchecked.
 
 ## Deployment (Continuous Deployment from GitHub)
 

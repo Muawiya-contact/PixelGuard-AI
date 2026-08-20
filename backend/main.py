@@ -12,6 +12,11 @@ from google import genai
 from google.genai import types as genai_types
 from PIL import Image
 
+from services import ela as ela_service
+from services import fingerprint as fingerprint_service
+from services import metadata as metadata_service
+from services import prelint
+
 load_dotenv()
 
 # Key via GOOGLE_API_KEY or PAID_GEMINI_API_KEY. Both developer-API keys (AIza…)
@@ -42,7 +47,7 @@ def get_client() -> genai.Client:
 app = FastAPI(
     title="PixelGuard API",
     description="AI Asset Provenance & Forensics Engine",
-    version="0.2.0",
+    version="0.4.0",
 )
 
 # CORS. Local dev origins are always allowed. Production origins come from
@@ -194,37 +199,127 @@ def _generate_report(image: Image.Image, user_prompt: str) -> tuple[dict, str]:
     raise last_exc if last_exc else RuntimeError("No model available")
 
 
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 15 * 1024 * 1024))
+
+
+async def _read_image(file: UploadFile) -> tuple[Image.Image, bytes]:
+    """Validate and decode an upload into (PIL image, original bytes).
+
+    The original bytes are kept because metadata forensics needs the intact
+    container — Pillow discards JUMBF/C2PA boxes on decode.
+    """
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image is {len(raw) // 1024} KB; limit is {MAX_UPLOAD_BYTES // 1024} KB.",
+        )
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decode the uploaded file as an image.")
+    return image, raw
+
+
+@app.post("/api/v1/analyze/ela")
+async def analyze_ela(
+    file: UploadFile = File(...),
+    quality: int = Form(90),
+):
+    """Error Level Analysis. Returns a base64 PNG heatmap plus metrics.
+
+    Runs entirely locally — no model call, no API key required.
+    """
+    image, _ = await _read_image(file)
+    if not 50 <= quality <= 100:
+        raise HTTPException(status_code=400, detail="quality must be between 50 and 100.")
+    try:
+        result = ela_service.compute_ela(image, quality=quality)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=redact(f"ELA failed: {exc}"))
+    return {"filename": file.filename, "ela": result}
+
+
+@app.post("/api/v1/analyze/metadata")
+async def analyze_metadata(file: UploadFile = File(...)):
+    """C2PA / EXIF / XMP provenance parse. Local only, no model call."""
+    image, raw = await _read_image(file)
+    try:
+        return {"filename": file.filename, "metadata": metadata_service.parse_metadata(image, raw)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=redact(f"Metadata parse failed: {exc}"))
+
+
+@app.post("/api/v1/analyze/fingerprint")
+async def analyze_fingerprint(file: UploadFile = File(...)):
+    """SHA-256, geometry and colour statistics. Local only, no model call."""
+    image, raw = await _read_image(file)
+    try:
+        return {"filename": file.filename, "fingerprint": fingerprint_service.fingerprint(image, raw)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=redact(f"Fingerprint failed: {exc}"))
+
+
 @app.post("/api/v1/forensics/analyze")
 async def analyze_image(
     file: UploadFile = File(...),
     prompt: str | None = Form(None),
+    include_ela: bool = Form(True),
 ):
+    """Full forensic pass: metadata -> model analysis -> prelint reconciliation.
+
+    Local evidence (metadata, ELA) is gathered first so the prelint stage can
+    reconcile the model's visual read against it rather than trusting it blindly.
+    """
     if not API_KEY:
         raise HTTPException(
             status_code=503,
             detail="No API key configured. Set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env.",
         )
 
-    if file.content_type and not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
+    image, raw = await _read_image(file)
 
-    raw = await file.read()
+    # Local evidence first — these never fail the request on their own.
     try:
-        image = Image.open(io.BytesIO(raw))
-        image.load()
+        meta = metadata_service.parse_metadata(image, raw)
+    except Exception as exc:
+        meta = {"verdict": "error", "rationale": redact(str(exc)), "ai_signatures": [], "editing_software": []}
+
+    try:
+        fingerprint = fingerprint_service.fingerprint(image, raw)
     except Exception:
-        raise HTTPException(status_code=400, detail="Could not decode the uploaded file as an image.")
+        fingerprint = None  # descriptive only; never block the analysis
+
+    ela_result = None
+    if include_ela:
+        try:
+            ela_result = ela_service.compute_ela(image)
+        except Exception:
+            ela_result = None  # ELA is supporting evidence; never block on it
+
+    # Inbound prelint: the caller's text is concatenated into the system prompt.
+    safe_prompt, prompt_findings = prelint.lint_prompt(prompt)
 
     user_prompt = FORENSICS_SYSTEM_PROMPT
-    if prompt:
-        user_prompt += f"\nAdditional analyst instructions: {prompt}"
+    if safe_prompt:
+        user_prompt += f"\nAdditional analyst instructions: {safe_prompt}"
 
     try:
-        report, model_used = _generate_report(image, user_prompt)
+        raw_report, model_used = _generate_report(image, user_prompt)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=redact(f"Gemini analysis failed: {exc}"))
+
+    # Outbound prelint: normalise, check consistency, reconcile with evidence.
+    report, output_findings = prelint.lint_report(raw_report, metadata=meta, ela=ela_result)
+    findings = prompt_findings + output_findings
 
     return {
         "filename": file.filename,
@@ -234,4 +329,8 @@ async def analyze_image(
         "model": model_used,
         "key_mode": KEY_MODE,
         "report": report,
+        "fingerprint": fingerprint,
+        "metadata": meta,
+        "ela": ela_result,
+        "prelint": {**prelint.summarise(findings), "findings": findings},
     }
