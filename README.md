@@ -104,22 +104,41 @@ Three things get you there:
 
 Set `GEMINI_MODEL=gemini-pro-latest` to trade latency back for the larger model. Note that `gemini-2.5-flash` is retired for new API keys and returns 404 — use the `-latest` aliases.
 
+### Three-tier classification
+
+Every report carries a `media_type` alongside the verdict, because "authentic" means something different for a photograph than for a drawing — calling a hand-made illustration merely *authentic* invites a reader to conclude it depicts something real.
+
+| `media_type` | `verdict_key` | `verdict` (display) |
+| --- | --- | --- |
+| `photograph` | `authentic_photograph` | Authentic Photograph |
+| `digital_art_illustration` | `authentic_digital_art` | Authentic Digital Art |
+| `ai_synthetic` | `ai_generated` | AI Generated |
+| — | `manipulated` | Manipulated |
+| `unknown` | `inconclusive` | Inconclusive / Human Review Needed |
+
+Reports include **both** `verdict_key` (stable snake_case) and `verdict` (the display string). All logic — prelint rules, UI styling, PDF colours — branches on the key; branching on prose means a copy-edit silently changes behaviour. The vocabulary lives in `backend/schemas/report.py`.
+
 ### False-positive guardrails
 
 Telling someone their own photograph is synthetic is the expensive mistake, so the pipeline is deliberately biased toward authenticity.
 
-- **The prompt** (`backend/services/gemini.py`) makes authenticity the null hypothesis and names the artefacts a vision model tends to over-read — portrait blur, JPEG mush, skin smoothing, motion blur, lens distortion — as explicitly *not* evidence. `ai_generated` requires structural impossibility (extra fingers, pseudotext glyphs, broken occlusion) or a provenance manifest.
-- **Rule B — organic EXIF priority.** Coherent capture settings (ISO, exposure, focal length) override a visual `ai_generated` call, unless a hard generator manifest is present.
-- **Rule A — low-confidence override.** A verdict of `ai_generated`/`manipulated` below 75% confidence, with metadata that is `inconclusive` or `no_metadata`, is overridden.
+The **prompt** (`backend/services/gemini.py`) classifies media type first, makes authenticity the null hypothesis, and names what a vision model over-reads — bokeh, JPEG mush, skin smoothing, motion blur, *and clean vector lines and flat cel shading*, which are what digital art **is** — as explicitly not evidence. `AI Generated` requires structural impossibility (extra fingers, pseudotext, broken occlusion) or a provenance manifest, at >80% confidence.
 
-Measured on three real phone photographs (portrait shots, soft focus, smooth skin): **all three return `authentic` with empty indicator lists.** Zero false positives, and the guardrails did not need to fire — the prompt alone held.
+Three deterministic rules then run in `backend/services/prelint.py`, each emitting a finding so a reviewer can see exactly what moved a verdict:
 
-**The cost is real and you should know it.** Re-encoding the Stable Diffusion fixture to strip its metadata flips it from `ai_generated` to `authentic`. With metadata gone — the normal state of anything downloaded from a social platform — AI detection rests almost entirely on the metadata parser, and the visual path will rarely contradict it. Rule A can be softened without a code change:
+| Rule | Condition | Effect |
+| --- | --- | --- |
+| **1 — Digital art sanitisation** | Verdict is authentic-photograph-shaped but media type (or style wording) says artwork | → `Authentic Digital Art` |
+| **2 — Low-confidence fallback** | `AI Generated` below 80% confidence, no C2PA manifest, `no_metadata` | → `Inconclusive / Human Review Needed`, integrity 50 |
+| **3 — EXIF priority guard** | Physical capture EXIF present (ISO, exposure, focal length, model) | → `Authentic Photograph`, unless C2PA declares synthetic generation |
 
-```bash
-PIXELGUARD_GUARDRAIL_A=inconclusive   # never assert authenticity on absent evidence
-PIXELGUARD_GUARDRAIL_A=off            # disable the override entirely
-```
+A generator signature in metadata outranks all three. When any rule moves a verdict the summary is annotated, so a certificate never reads "AI Generated" above "no generative AI indicators present".
+
+Set `PIXELGUARD_GUARDRAILS=off` to disable rules 1–3, or `PIXELGUARD_AI_CONFIDENCE_FLOOR` to move the rule-2 threshold.
+
+**Measured.** Three real phone photographs (portrait, soft focus, smooth skin) → `Authentic Photograph`, empty indicator lists. A flat cel-shaded anime fixture → `Authentic Digital Art`, with the mandated summary opening. The Stable Diffusion fixture → `AI Generated` via its metadata signature.
+
+**The residual gap:** strip the metadata from that AI fixture and it reads as authentic digital art. With metadata gone — the normal state of anything off a social platform — AI detection rests almost entirely on the metadata parser. Rules 1–3 do not close that; only a real generative-artefact detector would.
 
 ### What these detectors can and cannot tell you
 

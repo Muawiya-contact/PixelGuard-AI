@@ -17,11 +17,27 @@ import os
 import re
 from typing import Any
 
-VALID_VERDICTS = ("authentic", "ai_generated", "manipulated", "inconclusive")
+from schemas import (
+    MEDIA_TYPE_LABELS,
+    normalise_media_type,
+    resolve_verdict,
+    verdict_label,
+)
 
-# "authentic" (spec default), "inconclusive" (safer: never asserts authenticity
-# on absent evidence), or "off".
-GUARDRAIL_A_MODE = os.getenv("PIXELGUARD_GUARDRAIL_A", "authentic").strip().lower()
+# Set to "off" to disable the deterministic overrides entirely (RULE 1-3).
+GUARDRAILS_ENABLED = os.getenv("PIXELGUARD_GUARDRAILS", "on").strip().lower() != "off"
+
+# Confidence a model must exceed before "AI Generated" is allowed to stand.
+AI_CONFIDENCE_FLOOR = int(os.getenv("PIXELGUARD_AI_CONFIDENCE_FLOOR", 80))
+
+# Wording that betrays hand-authored artwork when the model forgot to set
+# media_type. Used only as a fallback — media_type wins when it is present.
+_ART_STYLE_HINTS = (
+    "vector", "line art", "lineart", "line work", "linework", "flat shading",
+    "cel shad", "digital art", "digital illustration", "illustration", "anime",
+    "manga", "cartoon", "comic", "graphic design", "logo", "pixel art",
+    "digital painting", "hand-drawn", "hand drawn", "stylised", "stylized",
+)
 
 MAX_PROMPT_CHARS = 600
 
@@ -134,14 +150,22 @@ def lint_report(
 
     clean: dict[str, Any] = {}
 
-    verdict = str(report.get("verdict", "")).strip().lower().replace("-", "_").replace(" ", "_")
-    if verdict not in VALID_VERDICTS:
-        if verdict:
-            findings.append({"stage": "output", "code": "verdict_invalid", "severity": "warning",
-                             "detail": f"Verdict {verdict!r} is outside the allowed set; coerced to 'inconclusive'."})
-        clean["verdict"] = "inconclusive"
-    else:
-        clean["verdict"] = verdict
+    raw_media = report.get("media_type")
+    media_type = normalise_media_type(raw_media)
+    if raw_media and not media_type:
+        findings.append({"stage": "output", "code": "media_type_invalid", "severity": "warning",
+                         "detail": f"media_type {raw_media!r} is outside the allowed set; treated as unknown."})
+    if not media_type:
+        media_type = "unknown"
+
+    raw_verdict = report.get("verdict")
+    verdict_key = resolve_verdict(raw_verdict, media_type)
+    if raw_verdict and verdict_key == "inconclusive" and not str(raw_verdict).lower().startswith("inconc"):
+        findings.append({"stage": "output", "code": "verdict_invalid", "severity": "warning",
+                         "detail": f"Verdict {raw_verdict!r} could not be mapped to the allowed set; "
+                                   f"treated as inconclusive."})
+    clean["media_type"] = media_type
+    clean["verdict_key"] = verdict_key
 
     for field in ("integrity_score", "confidence"):
         # Models occasionally echo the prompt's wording instead of the schema key.
@@ -192,102 +216,168 @@ def lint_report(
                          "detail": "Model returned no summary text."})
 
     # --- self-consistency -------------------------------------------------
-    if clean["verdict"] == "authentic" and clean["tampering_detection"]["detected"]:
+    authentic_keys = ("authentic_photograph", "authentic_digital_art")
+    if clean["verdict_key"] in authentic_keys and clean["tampering_detection"]["detected"]:
         findings.append({"stage": "consistency", "code": "verdict_contradicts_tampering", "severity": "warning",
-                         "detail": "Verdict 'authentic' contradicts tampering_detection.detected=true."})
-    if clean["verdict"] == "ai_generated" and not clean["model_signature"]["likely_ai_generated"]:
+                         "detail": f"Verdict '{verdict_label(clean['verdict_key'])}' contradicts "
+                                   f"tampering_detection.detected=true."})
+    if clean["verdict_key"] == "ai_generated" and not clean["model_signature"]["likely_ai_generated"]:
         findings.append({"stage": "consistency", "code": "verdict_contradicts_signature", "severity": "warning",
-                         "detail": "Verdict 'ai_generated' contradicts likely_ai_generated=false."})
+                         "detail": "Verdict 'AI Generated' contradicts likely_ai_generated=false."})
     score = clean.get("integrity_score")
     if score is not None:
-        if clean["verdict"] == "authentic" and score < 40:
+        if clean["verdict_key"] in authentic_keys and score < 40:
             findings.append({"stage": "consistency", "code": "score_contradicts_verdict", "severity": "warning",
-                             "detail": f"Verdict 'authentic' with an integrity score of {score}."})
-        if clean["verdict"] == "manipulated" and score > 80:
+                             "detail": f"Authentic verdict with an integrity score of {score}."})
+        if clean["verdict_key"] == "manipulated" and score > 80:
             findings.append({"stage": "consistency", "code": "score_contradicts_verdict", "severity": "warning",
-                             "detail": f"Verdict 'manipulated' with an integrity score of {score}."})
+                             "detail": f"Verdict 'Manipulated' with an integrity score of {score}."})
 
-    # --- reconcile against hard evidence ---------------------------------
-    if metadata:
-        meta_ai = [s for s in metadata.get("ai_signatures", [])]
-        if meta_ai and clean["verdict"] not in ("ai_generated", "manipulated"):
-            labels = ", ".join(s["label"] for s in meta_ai)
-            findings.append({
-                "stage": "evidence", "code": "metadata_overrides_verdict", "severity": "error",
-                "detail": f"Metadata carries an explicit generator signature ({labels}) but the visual "
-                          f"verdict was '{clean['verdict']}'. Metadata is the stronger evidence here.",
-            })
-            clean["verdict"] = "ai_generated"
-            clean["model_signature"]["likely_ai_generated"] = True
-            if not clean["model_signature"]["suspected_model_family"]:
-                clean["model_signature"]["suspected_model_family"] = meta_ai[0]["label"]
-            clean["model_signature"]["signature_evidence"].append(
-                f"Metadata signature: {labels} (from {meta_ai[0]['source']})"
-            )
-        if metadata.get("editing_software") and not clean["tampering_detection"]["detected"]:
-            findings.append({
-                "stage": "evidence", "code": "editor_metadata_present", "severity": "info",
-                "detail": f"Metadata names editing software ({', '.join(metadata['editing_software'])}). "
-                          f"Indicates processing, not necessarily deceptive manipulation.",
-            })
-
-    # --- deterministic false-positive guardrails -------------------------
-    # A forensics tool's expensive mistake is telling someone their own
-    # photograph is synthetic, so these rules deliberately bias toward
-    # authenticity. They are stated as hard rules rather than prompt guidance
-    # because a model cannot be relied on to police itself.
+    # --- reconcile against hard metadata evidence ------------------------
     meta_verdict = (metadata or {}).get("verdict")
-    hard_ai_manifest = bool(
-        (metadata or {}).get("ai_signatures")
-        or ((metadata or {}).get("c2pa", {}) or {}).get("claim_generator")
+    c2pa = (metadata or {}).get("c2pa") or {}
+    ai_signatures = (metadata or {}).get("ai_signatures") or []
+    # A manifest naming a generative model is the only thing that outranks
+    # camera EXIF under RULE 3.
+    c2pa_declares_synthetic = bool(
+        c2pa.get("present")
+        and re.search(
+            r"midjourney|dall|stable\s*diffusion|firefly|imagen|synthid|generative|gan\b",
+            str(c2pa.get("claim_generator") or ""),
+            re.IGNORECASE,
+        )
     )
+    hard_ai_manifest = bool(ai_signatures) or c2pa_declares_synthetic
 
-    # RULE B — organic EXIF beats a visual AI call. Capture settings (ISO,
-    # exposure, focal length) are written by a camera pipeline; a generator has
-    # no reason to fabricate a coherent set. Only a hard generator manifest
-    # outranks them.
-    camera = (metadata or {}).get("camera_evidence") or {}
-    if (
-        camera.get("present")
-        and clean["verdict"] == "ai_generated"
-        and not hard_ai_manifest
-    ):
-        fields = ", ".join(sorted(camera.get("fields", {}))[:4]) or "capture fields"
+    if hard_ai_manifest and clean["verdict_key"] != "ai_generated":
+        labels = ", ".join(x["label"] for x in ai_signatures) or "C2PA generative manifest"
         findings.append({
-            "stage": "evidence", "code": "organic_exif_priority", "severity": "error",
-            "detail": f"Camera capture EXIF present ({fields}) with no generator manifest; "
-                      f"overriding the model's 'ai_generated' verdict to 'authentic'. "
-                      f"Note EXIF is forgeable — this favours the photographer by design.",
+            "stage": "evidence", "code": "metadata_overrides_verdict", "severity": "error",
+            "detail": f"Metadata carries an explicit generator signature ({labels}) but the visual "
+                      f"verdict was '{verdict_label(clean['verdict_key'])}'. Metadata is the stronger "
+                      f"evidence here.",
         })
-        clean["verdict"] = "authentic"
-        clean["model_signature"]["likely_ai_generated"] = False
+        clean["verdict_key"] = "ai_generated"
+        clean["media_type"] = "ai_synthetic"
+        clean["model_signature"]["likely_ai_generated"] = True
+        if not clean["model_signature"]["suspected_model_family"] and ai_signatures:
+            clean["model_signature"]["suspected_model_family"] = ai_signatures[0]["label"]
+        clean["model_signature"]["signature_evidence"].append(f"Metadata signature: {labels}")
 
-    # RULE A — a low-confidence call on an image with no metadata to corroborate
-    # it is not enough to accuse a photograph.
-    #
-    # The cost is real: images stripped of metadata are the common case on every
-    # social platform, so this also suppresses genuine low-confidence AI
-    # detections. Set PIXELGUARD_GUARDRAIL_A=inconclusive to downgrade to
-    # "inconclusive" instead of asserting authenticity, or =off to disable.
-    if (
-        GUARDRAIL_A_MODE != "off"
-        and meta_verdict in ("inconclusive", "no_metadata")
-        and not hard_ai_manifest
-        and clean.get("confidence") is not None
-        and clean["confidence"] < 75
-        and clean["verdict"] in ("ai_generated", "manipulated")
-    ):
-        target = "inconclusive" if GUARDRAIL_A_MODE == "inconclusive" else "authentic"
+    if (metadata or {}).get("editing_software") and not clean["tampering_detection"]["detected"]:
         findings.append({
-            "stage": "evidence", "code": "false_positive_guardrail_applied", "severity": "error",
-            "detail": f"Model returned '{clean['verdict']}' at {clean['confidence']}% confidence with "
-                      f"metadata '{meta_verdict}'. Below the 75% threshold with nothing to corroborate "
-                      f"it, so the verdict is set to '{target}'.",
+            "stage": "evidence", "code": "editor_metadata_present", "severity": "info",
+            "detail": f"Metadata names editing software ({', '.join(metadata['editing_software'])}). "
+                      f"Indicates processing, not necessarily deceptive manipulation.",
         })
-        clean["verdict"] = target
-        if target == "authentic":
+
+    # --- deterministic overrides (RULE 1-3) ------------------------------
+    # Hard rules rather than prompt guidance, because a model cannot be relied
+    # on to police itself — and because a reviewer needs to see exactly which
+    # rule moved a verdict, so each one emits a finding.
+    if GUARDRAILS_ENABLED:
+        camera = (metadata or {}).get("camera_evidence") or {}
+        camera_fields = set(camera.get("fields") or {})
+        # The spec's named fields, plus the tags Pillow actually surfaces.
+        physical_capture = bool(camera.get("present")) or bool(
+            camera_fields & {
+                "ISO", "ISOSpeedRatings", "ShutterSpeed", "ShutterSpeedValue",
+                "ExposureTime", "FocalLength", "CameraModel", "Model", "Make", "LensModel",
+            }
+        )
+
+        # RULE 3 — organic capture EXIF outranks a visual AI guess. A camera
+        # pipeline writes a coherent set of capture settings; a generator has no
+        # reason to fabricate one. Only a synthetic C2PA manifest beats it.
+        if (
+            clean["verdict_key"] == "ai_generated"
+            and physical_capture
+            and not c2pa_declares_synthetic
+            and not ai_signatures
+        ):
+            named = ", ".join(sorted(camera_fields)[:4]) or "capture fields"
+            findings.append({
+                "stage": "evidence", "code": "exif_priority_guard", "severity": "error",
+                "detail": f"RULE 3: physical camera EXIF present ({named}) with no synthetic C2PA "
+                          f"manifest; overriding 'AI Generated' to 'Authentic Photograph'. EXIF is "
+                          f"forgeable — this deliberately favours the photographer.",
+            })
+            clean["verdict_key"] = "authentic_photograph"
+            clean["media_type"] = "photograph"
             clean["model_signature"]["likely_ai_generated"] = False
 
+        # RULE 2 — a low-confidence AI call with nothing corroborating it is a
+        # coin flip, not a finding. Downgraded to human review rather than to
+        # "authentic": asserting authenticity on absent evidence would be the
+        # same overreach in the other direction.
+        if (
+            clean["verdict_key"] == "ai_generated"
+            and clean.get("confidence") is not None
+            and clean["confidence"] < AI_CONFIDENCE_FLOOR
+            and not c2pa.get("present")
+            and meta_verdict == "no_metadata"
+        ):
+            findings.append({
+                "stage": "evidence", "code": "low_confidence_fallback", "severity": "error",
+                "detail": f"RULE 2: 'AI Generated' at {clean['confidence']}% confidence "
+                          f"(floor {AI_CONFIDENCE_FLOOR}%) with no C2PA manifest and no metadata. "
+                          f"Downgraded to human review; integrity score set to 50.",
+            })
+            clean["verdict_key"] = "inconclusive"
+            if clean["media_type"] == "ai_synthetic":
+                clean["media_type"] = "unknown"
+            clean["integrity_score"] = 50
+            clean["model_signature"]["likely_ai_generated"] = False
+
+        # RULE 1 — a human illustration called merely "authentic" reads as
+        # though it depicts something real. media_type decides; the style hints
+        # apply only when the model omitted it.
+        # A bare "Authentic" with no media_type resolves to inconclusive, which
+        # is exactly the case this rule exists to catch, so it is eligible too.
+        was_bare_authentic = str(raw_verdict or "").strip().lower().startswith("authentic")
+        eligible_for_rule_1 = clean["verdict_key"] == "authentic_photograph" or (
+            was_bare_authentic and clean["verdict_key"] == "inconclusive"
+        )
+        if eligible_for_rule_1:
+            haystack = " ".join([
+                str(clean.get("summary") or ""),
+                str(clean.get("provenance_notes") or ""),
+                " ".join(clean["model_signature"]["signature_evidence"]),
+            ]).lower()
+            style_hit = next((h for h in _ART_STYLE_HINTS if h in haystack), None)
+            if clean["media_type"] == "digital_art_illustration" or (
+                clean["media_type"] in ("unknown", None) and style_hit
+            ):
+                reason = (
+                    "media_type is digital_art_illustration"
+                    if clean["media_type"] == "digital_art_illustration"
+                    else f"style wording {style_hit!r} with no media_type set"
+                )
+                findings.append({
+                    "stage": "output", "code": "digital_art_sanitisation", "severity": "warning",
+                    "detail": f"RULE 1: {reason}, so the verdict is 'Authentic Digital Art' rather "
+                              f"than a photograph classification.",
+                })
+                clean["verdict_key"] = "authentic_digital_art"
+                clean["media_type"] = "digital_art_illustration"
+
+    # An overridden verdict leaves the model's summary describing the verdict it
+    # no longer has — a certificate reading "AI Generated" above "no generative
+    # AI indicators present" looks broken. Say plainly that a rule moved it.
+    if clean["verdict_key"] != verdict_key:
+        clean["model_verdict_key"] = verdict_key
+        note = (
+            f"Adjusted by PixelGuard: the model's visual read was "
+            f"'{verdict_label(verdict_key)}'; the verdict above was set by a "
+            f"deterministic evidence rule (see verification findings)."
+        )
+        clean["summary"] = f"{clean['summary']} {note}".strip() if clean["summary"] else note
+
+    # Human-facing strings are derived last, from the final key.
+    clean["verdict"] = verdict_label(clean["verdict_key"])
+    clean["media_type_label"] = MEDIA_TYPE_LABELS.get(clean["media_type"], "Unknown")
+
+    # --- ELA is advisory only --------------------------------------------
     if ela:
         signal = (ela.get("interpretation") or {}).get("signal")
         regions = ela.get("focus_regions") or []
