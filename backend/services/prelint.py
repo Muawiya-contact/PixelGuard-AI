@@ -13,10 +13,15 @@ Two jobs, both sitting between the caller and the final JSON:
    than silently patched, so a reviewer can see where the model was corrected.
 """
 
+import os
 import re
 from typing import Any
 
 VALID_VERDICTS = ("authentic", "ai_generated", "manipulated", "inconclusive")
+
+# "authentic" (spec default), "inconclusive" (safer: never asserts authenticity
+# on absent evidence), or "off".
+GUARDRAIL_A_MODE = os.getenv("PIXELGUARD_GUARDRAIL_A", "authentic").strip().lower()
 
 MAX_PROMPT_CHARS = 600
 
@@ -139,7 +144,10 @@ def lint_report(
         clean["verdict"] = verdict
 
     for field in ("integrity_score", "confidence"):
+        # Models occasionally echo the prompt's wording instead of the schema key.
         raw = report.get(field)
+        if raw is None and field == "confidence":
+            raw = report.get("model_confidence")
         val = _as_int(raw, 0, 100)
         if raw is not None and val is None:
             findings.append({"stage": "output", "code": f"{field}_invalid", "severity": "warning",
@@ -222,6 +230,63 @@ def lint_report(
                 "detail": f"Metadata names editing software ({', '.join(metadata['editing_software'])}). "
                           f"Indicates processing, not necessarily deceptive manipulation.",
             })
+
+    # --- deterministic false-positive guardrails -------------------------
+    # A forensics tool's expensive mistake is telling someone their own
+    # photograph is synthetic, so these rules deliberately bias toward
+    # authenticity. They are stated as hard rules rather than prompt guidance
+    # because a model cannot be relied on to police itself.
+    meta_verdict = (metadata or {}).get("verdict")
+    hard_ai_manifest = bool(
+        (metadata or {}).get("ai_signatures")
+        or ((metadata or {}).get("c2pa", {}) or {}).get("claim_generator")
+    )
+
+    # RULE B — organic EXIF beats a visual AI call. Capture settings (ISO,
+    # exposure, focal length) are written by a camera pipeline; a generator has
+    # no reason to fabricate a coherent set. Only a hard generator manifest
+    # outranks them.
+    camera = (metadata or {}).get("camera_evidence") or {}
+    if (
+        camera.get("present")
+        and clean["verdict"] == "ai_generated"
+        and not hard_ai_manifest
+    ):
+        fields = ", ".join(sorted(camera.get("fields", {}))[:4]) or "capture fields"
+        findings.append({
+            "stage": "evidence", "code": "organic_exif_priority", "severity": "error",
+            "detail": f"Camera capture EXIF present ({fields}) with no generator manifest; "
+                      f"overriding the model's 'ai_generated' verdict to 'authentic'. "
+                      f"Note EXIF is forgeable — this favours the photographer by design.",
+        })
+        clean["verdict"] = "authentic"
+        clean["model_signature"]["likely_ai_generated"] = False
+
+    # RULE A — a low-confidence call on an image with no metadata to corroborate
+    # it is not enough to accuse a photograph.
+    #
+    # The cost is real: images stripped of metadata are the common case on every
+    # social platform, so this also suppresses genuine low-confidence AI
+    # detections. Set PIXELGUARD_GUARDRAIL_A=inconclusive to downgrade to
+    # "inconclusive" instead of asserting authenticity, or =off to disable.
+    if (
+        GUARDRAIL_A_MODE != "off"
+        and meta_verdict in ("inconclusive", "no_metadata")
+        and not hard_ai_manifest
+        and clean.get("confidence") is not None
+        and clean["confidence"] < 75
+        and clean["verdict"] in ("ai_generated", "manipulated")
+    ):
+        target = "inconclusive" if GUARDRAIL_A_MODE == "inconclusive" else "authentic"
+        findings.append({
+            "stage": "evidence", "code": "false_positive_guardrail_applied", "severity": "error",
+            "detail": f"Model returned '{clean['verdict']}' at {clean['confidence']}% confidence with "
+                      f"metadata '{meta_verdict}'. Below the 75% threshold with nothing to corroborate "
+                      f"it, so the verdict is set to '{target}'.",
+        })
+        clean["verdict"] = target
+        if target == "authentic":
+            clean["model_signature"]["likely_ai_generated"] = False
 
     if ela:
         signal = (ela.get("interpretation") or {}).get("signal")

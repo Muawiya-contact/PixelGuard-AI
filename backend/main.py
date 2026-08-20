@@ -10,6 +10,7 @@ import re
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from google import genai
 from google.genai import types as genai_types
 from PIL import Image
@@ -17,6 +18,7 @@ from urllib.parse import urlparse
 
 from services import ela as ela_service
 from services import fetch_url as fetch_url_service
+from services.gemini import FORENSICS_SYSTEM_PROMPT
 from services import fingerprint as fingerprint_service
 from services import metadata as metadata_service
 from services import prelint
@@ -95,29 +97,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FORENSICS_SYSTEM_PROMPT = """\
-You are PixelGuard, an expert digital-image forensics engine. Analyze the provided
-image for authenticity, tampering, and AI-generation signatures.
-
-Respond ONLY with a valid JSON object (no markdown fences, no commentary) using
-exactly this schema:
-{
-  "verdict": "authentic" | "ai_generated" | "manipulated" | "inconclusive",
-  "integrity_score": <integer 0-100, where 100 = fully authentic>,
-  "confidence": <integer 0-100>,
-  "tampering_detection": {
-    "detected": <boolean>,
-    "indicators": [<list of specific artifacts observed, e.g. cloning, splicing, inpainting, warped anatomy, inconsistent lighting/shadows, JPEG ghosting>]
-  },
-  "model_signature": {
-    "likely_ai_generated": <boolean>,
-    "suspected_model_family": <string or null, e.g. "Midjourney", "DALL-E", "Stable Diffusion", "GAN", null>,
-    "signature_evidence": [<list of stylistic/statistical cues>]
-  },
-  "provenance_notes": <string: brief summary of visible metadata-independent provenance cues>,
-  "summary": <string: 2-3 sentence human-readable forensic conclusion>
-}
-"""
 
 
 @app.get("/")
@@ -381,28 +360,21 @@ async def analyze_local(
     }
 
 
-@app.post("/api/v1/forensics/analyze")
-async def analyze_image(
-    file: UploadFile = File(...),
-    prompt: str | None = Form(None),
-    include_ela: bool = Form(True),
-):
-    """Full forensic pass.
+class UrlRequest(BaseModel):
+    url: str
+    prompt: str | None = None
+    include_ela: bool = True
 
-    Local evidence and the model call run concurrently rather than in sequence:
-    the local work is pure CPU and the Gemini call is pure wait, so overlapping
-    them makes the request cost about what the model call alone costs.
-    """
-    if not API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="No API key configured. Set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env.",
-        )
 
-    image, raw = await _read_image(file)
-
-    # Inbound prelint runs first: the caller's text is concatenated into the
-    # system prompt, so it must be sanitised before the model call is launched.
+async def _run_pipeline(
+    image: Image.Image,
+    raw: bytes,
+    filename: str,
+    content_type: str,
+    prompt: str | None,
+    include_ela: bool,
+) -> dict:
+    """The full forensic pass, shared by the upload and URL entry points."""
     safe_prompt, prompt_findings = prelint.lint_prompt(prompt)
     user_prompt = FORENSICS_SYSTEM_PROMPT
     if safe_prompt:
@@ -424,16 +396,14 @@ async def analyze_image(
         )
 
     raw_report, model_used = model_result
-
-    # Outbound prelint: normalise, check consistency, reconcile with evidence.
     report, output_findings = prelint.lint_report(
         raw_report, metadata=evidence["metadata"], ela=evidence["ela"]
     )
     findings = prompt_findings + output_findings
 
     return {
-        "filename": file.filename,
-        "content_type": file.content_type,
+        "filename": filename,
+        "content_type": content_type,
         "size_bytes": len(raw),
         "dimensions": {"width": image.width, "height": image.height},
         "model": model_used,
@@ -444,3 +414,57 @@ async def analyze_image(
         "ela": evidence["ela"],
         "prelint": {**prelint.summarise(findings), "findings": findings},
     }
+
+
+@app.post("/api/v1/analyze/url")
+async def analyze_url(payload: UrlRequest):
+    """Fetch a public image URL and run the full pipeline on the bytes.
+
+    Same SSRF guards as /fetch-url, plus a JPEG/PNG/WebP allowlist and a 10 MB
+    cap. The bytes go straight into the pipeline — nothing is written to disk.
+    """
+    if not API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="No API key configured. Set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env.",
+        )
+    try:
+        raw, content_type, final_url = await fetch_url_service.fetch_image_async(payload.url)
+    except fetch_url_service.FetchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=redact(f"Fetch failed: {exc}"))
+
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="The URL did not return a decodable image.")
+
+    name = (urlparse(final_url).path.rsplit("/", 1)[-1] or "remote-image")[:120]
+    if "." not in name:
+        name = f"{name}.{(image.format or 'jpg').lower()}"
+
+    result = await _run_pipeline(
+        image, raw, name, content_type, payload.prompt, payload.include_ela
+    )
+    result["source_url"] = final_url
+    return result
+
+
+@app.post("/api/v1/forensics/analyze")
+async def analyze_image(
+    file: UploadFile = File(...),
+    prompt: str | None = Form(None),
+    include_ela: bool = Form(True),
+):
+    """Full forensic pass on an uploaded file."""
+    if not API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="No API key configured. Set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env.",
+        )
+    image, raw = await _read_image(file)
+    return await _run_pipeline(
+        image, raw, file.filename, file.content_type, prompt, include_ela
+    )
