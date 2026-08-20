@@ -309,7 +309,8 @@ def lint_report(
     # Capture EXIF says "camera", the visual read says otherwise. Neither is
     # necessarily wrong — EXIF is forgeable and a photo of a screen is still a
     # photo — but silently picking one would hide the disagreement, which is the
-    # thing a reviewer most needs to see. Reported, never auto-resolved.
+    # thing a reviewer most needs to see. Reported, never auto-resolved: the
+    # existing reconciliation rules remain the only things that move a verdict.
     if (
         physical_capture
         and not hard_ai_manifest
