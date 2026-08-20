@@ -150,8 +150,25 @@ def lint_report(
     """
     findings: list[dict] = []
     if not isinstance(report, dict):
+        # Must return the same shape as the happy path: the UI and the PDF both
+        # key off verdict_key, and a bare dict here left them undefined.
         return (
-            {"verdict": "inconclusive", "integrity_score": None, "summary": "Model returned no usable JSON."},
+            {
+                "verdict_key": "inconclusive",
+                "verdict": verdict_label("inconclusive"),
+                "media_type": "unknown",
+                "media_type_label": MEDIA_TYPE_LABELS["unknown"],
+                "integrity_score": None,
+                "confidence": None,
+                "tampering_detection": {"detected": False, "indicators": []},
+                "model_signature": {
+                    "likely_ai_generated": False,
+                    "suspected_model_family": None,
+                    "signature_evidence": [],
+                },
+                "provenance_notes": "",
+                "summary": "Model returned no usable JSON.",
+            },
             [{"stage": "output", "code": "unparseable", "severity": "error",
               "detail": f"Expected a JSON object, got {type(report).__name__}."}],
         )
