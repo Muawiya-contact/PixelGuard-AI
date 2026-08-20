@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Images, ChevronDown, Loader2 } from 'lucide-react'
-import { SAMPLE_CATEGORIES, resolveSampleUrl } from '../constants/samples.js'
+import { SAMPLE_CATEGORIES } from '../constants/samples.js'
 
 /**
  * One-click fixtures, grouped into the three categories defined in
@@ -18,30 +18,9 @@ import { SAMPLE_CATEGORIES, resolveSampleUrl } from '../constants/samples.js'
 export default function SampleGallery({ onPick, disabled }) {
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(null)
-  const [resolved, setResolved] = useState(null) // null = not probed yet
-
-  // Probe once, the first time the gallery is opened.
-  useEffect(() => {
-    if (!open || resolved) return
-    let cancelled = false
-    ;(async () => {
-      const out = await Promise.all(
-        SAMPLE_CATEGORIES.map(async (cat) => ({
-          ...cat,
-          samples: (
-            await Promise.all(
-              cat.samples.map(async (s) => {
-                const url = await resolveSampleUrl(cat.dir, s.file)
-                return url ? { ...s, url } : null
-              }),
-            )
-          ).filter(Boolean),
-        })),
-      )
-      if (!cancelled) setResolved(out)
-    })()
-    return () => { cancelled = true }
-  }, [open, resolved])
+  // Vite's glob only yields files that exist, so nothing needs probing and
+  // nothing can be listed-but-missing.
+  const categories = SAMPLE_CATEGORIES
 
   const pick = async (cat, sample) => {
     if (disabled || loading) return
@@ -63,7 +42,6 @@ export default function SampleGallery({ onPick, disabled }) {
     }
   }
 
-  const categories = resolved ?? []
   const total = categories.reduce((n, c) => n + c.samples.length, 0)
 
   return (
@@ -83,14 +61,10 @@ export default function SampleGallery({ onPick, disabled }) {
 
       {open && (
         <div className="border-t border-line p-3">
-          {resolved === null ? (
-            <div className="flex items-center justify-center gap-2 py-6 text-sm text-faint">
-              <Loader2 size={16} className="animate-spin" /> Looking for samples…
-            </div>
-          ) : total === 0 ? (
+          {total === 0 ? (
             <p className="break-anywhere px-1 py-4 text-[11px] leading-relaxed text-faint">
-              No sample images found. Add files under <code>public/images/&lt;category&gt;/</code> and
-              list them in <code>src/constants/samples.js</code>.
+              No sample images found. Drop files into{' '}
+              <code>src/assets/samples/&lt;category&gt;/</code> — they are picked up automatically.
             </p>
           ) : (
             <div className="flex flex-col gap-4">
@@ -103,8 +77,7 @@ export default function SampleGallery({ onPick, disabled }) {
 
                   {cat.samples.length === 0 ? (
                     <p className="break-anywhere rounded-lg border border-dashed border-line px-3 py-2 text-[11px] text-faint">
-                      Nothing found in <code>{cat.dir}/</code> — check the filenames listed in{' '}
-                      <code>samples.js</code>.
+                      Nothing in <code>src/assets/samples/{cat.id}/</code> yet.
                     </p>
                   ) : (
                     <div className="grid gap-2 sm:grid-cols-3">
