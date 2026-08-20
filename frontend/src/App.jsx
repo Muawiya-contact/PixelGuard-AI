@@ -3,7 +3,7 @@ import {
   ShieldCheck, ShieldAlert, ShieldQuestion, UploadCloud, ScanSearch, Loader2,
   ImageIcon, Fingerprint, Cpu, FileWarning, Activity, FileText, Layers,
   FileSearch, CheckCircle2, AlertTriangle, Info, X, RotateCcw, Hash,
-  Link2, ClipboardCopy, Check,
+  Link2, ClipboardCopy, Check, Palette, Camera,
 } from 'lucide-react'
 import CompareSlider from './components/CompareSlider.jsx'
 import SampleGallery from './components/SampleGallery.jsx'
@@ -24,11 +24,21 @@ const TONE = {
   neutral: 'text-muted bg-raised border-line',
 }
 
+// Keyed by verdict_key, never by the display string: branching on prose means
+// a copy-edit silently changes behaviour. The backend sends both.
 const VERDICT_STYLES = {
-  authentic: { label: 'Authentic', icon: ShieldCheck, tone: TONE.emerald },
+  authentic_photograph: { label: 'Authentic Photograph', icon: ShieldCheck, tone: TONE.emerald },
+  authentic_digital_art: { label: 'Authentic Digital Art', icon: Palette, tone: TONE.sky },
   ai_generated: { label: 'AI Generated', icon: Cpu, tone: TONE.fuchsia },
   manipulated: { label: 'Manipulated', icon: ShieldAlert, tone: TONE.rose },
-  inconclusive: { label: 'Inconclusive', icon: ShieldQuestion, tone: TONE.amber },
+  inconclusive: { label: 'Inconclusive / Human Review Needed', icon: ShieldQuestion, tone: TONE.amber },
+}
+
+const MEDIA_TYPE_STYLES = {
+  photograph: { label: 'Photograph', icon: Camera, tone: TONE.emerald },
+  digital_art_illustration: { label: 'Digital Art / Illustration', icon: Palette, tone: TONE.sky },
+  ai_synthetic: { label: 'AI Synthetic', icon: Cpu, tone: TONE.fuchsia },
+  unknown: { label: 'Unknown media type', icon: ShieldQuestion, tone: TONE.neutral },
 }
 
 const SEVERITY = {
@@ -320,7 +330,11 @@ function AnalysisPanel({ loading, error, result, evidence }) {
 
   const report = result?.report || {}
   const modelPending = !result && loading
-  const verdict = VERDICT_STYLES[report.verdict] || VERDICT_STYLES.inconclusive
+  const verdict = VERDICT_STYLES[report.verdict_key] || VERDICT_STYLES.inconclusive
+  // Prefer the backend's string so wording stays in one place.
+  const verdictLabel = report.verdict || verdict.label
+  const media = MEDIA_TYPE_STYLES[report.media_type] || MEDIA_TYPE_STYLES.unknown
+  const MediaIcon = media.icon
   const VerdictIcon = verdict.icon
   const score = Number.isFinite(report.integrity_score) ? report.integrity_score : null
   const tampering = report.tampering_detection || {}
@@ -337,8 +351,14 @@ function AnalysisPanel({ loading, error, result, evidence }) {
           <div className="min-w-0">
             <p className="text-[10px] uppercase tracking-widest text-faint">Verdict</p>
             <p className="break-anywhere text-lg font-semibold text-fg">
-              {modelPending ? 'Awaiting model analysis…' : `Status: ${verdict.label}`}
+              {modelPending ? 'Awaiting model analysis…' : verdictLabel}
             </p>
+            {!modelPending && report.media_type && (
+              <p className="mt-1 flex items-center gap-1.5 text-xs text-muted">
+                <MediaIcon size={11} className="shrink-0" />
+                {report.media_type_label || media.label}
+              </p>
+            )}
           </div>
         </div>
         {modelPending ? (

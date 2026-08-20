@@ -23,14 +23,17 @@ const INK = {
 }
 const ACCENT = [8, 145, 178]
 
+// Fallback labels only: the backend sends the authoritative `verdict` string.
 const VERDICT_LABEL = {
-  authentic: 'Authentic',
-  ai_generated: 'AI generated',
+  authentic_photograph: 'Authentic Photograph',
+  authentic_digital_art: 'Authentic Digital Art',
+  ai_generated: 'AI Generated',
   manipulated: 'Manipulated',
-  inconclusive: 'Inconclusive',
+  inconclusive: 'Inconclusive / Human Review Needed',
 }
 const VERDICT_COLOR = {
-  authentic: [16, 133, 96],
+  authentic_photograph: [16, 133, 96],
+  authentic_digital_art: [12, 110, 160],
   ai_generated: [155, 44, 155],
   manipulated: [190, 45, 65],
   inconclusive: [176, 120, 20],
@@ -109,7 +112,8 @@ export async function buildCertificate(result, originalSrc = null) {
   const colour = fp.colour || {}
   const meta = result.metadata || {}
   const ela = result.ela || null
-  const verdict = report.verdict || 'inconclusive'
+  const verdict = report.verdict_key || 'inconclusive'
+  const verdictText = report.verdict || VERDICT_LABEL[verdict] || VERDICT_LABEL.inconclusive
   const score = Number.isFinite(report.integrity_score) ? report.integrity_score : null
 
   const [origImg, elaImg] = await Promise.all([
@@ -149,19 +153,24 @@ export async function buildCertificate(result, originalSrc = null) {
 
   // ---- verdict strip ----
   const vc = VERDICT_COLOR[verdict] || VERDICT_COLOR.inconclusive
+  // The pill grows to fit: "Inconclusive / Human Review Needed" is far wider
+  // than "Authentic", and a fixed width would clip it.
+  doc.setFont('helvetica', 'bold').setFontSize(11)
+  const pillW = Math.min(doc.getTextWidth(verdictText) + 22, 250)
   doc.setFillColor(...vc)
-  doc.roundedRect(MX, y, 132, 26, 5, 5, 'F')
-  doc.setTextColor(255, 255, 255).setFont('helvetica', 'bold').setFontSize(11)
-  doc.text(VERDICT_LABEL[verdict] || 'Inconclusive', MX + 11, y + 17.5)
+  doc.roundedRect(MX, y, pillW, 26, 5, 5, 'F')
+  doc.setTextColor(255, 255, 255)
+  doc.text(verdictText, MX + 11, y + 17.5)
+  const statsX = MX + pillW + 14
 
   doc.setTextColor(...INK.body).setFont('helvetica', 'normal').setFontSize(9.5)
   const scoreTxt = `Integrity ${score === null ? '—' : `${score}/100`}`
   const confTxt = Number.isFinite(report.confidence) ? `Confidence ${report.confidence}%` : 'Confidence —'
   const lintTxt = `Verification: ${result.prelint?.status ?? '—'} (${result.prelint?.total ?? 0})`
-  doc.text(scoreTxt, MX + 146, y + 11)
-  doc.text(confTxt, MX + 146, y + 22)
-  doc.text(lintTxt, MX + 300, y + 11)
-  doc.text(`Model: ${result.model || '—'}`, MX + 300, y + 22)
+  doc.text(scoreTxt, statsX, y + 11)
+  doc.text(confTxt, statsX, y + 22)
+  doc.text(lintTxt, Math.max(statsX + 150, MX + 310), y + 11)
+  doc.text(`Model: ${result.model || '—'}`, Math.max(statsX + 150, MX + 310), y + 22)
   y += 26 + 12
 
   // ---- structural fingerprint: 3-column micro-grid ----
@@ -186,6 +195,7 @@ export async function buildCertificate(result, originalSrc = null) {
     ['Aspect', aspect.simplified ? `${aspect.simplified}${aspect.name ? ` (${aspect.name})` : ''}` : '—'],
     ['Mean RGB', colour.mean_rgb ? `${colour.mean_rgb.r} / ${colour.mean_rgb.g} / ${colour.mean_rgb.b}` : '—'],
     ['RGB balance', colour.channel_balance ? `R ${(colour.channel_balance.r * 100).toFixed(0)}%  G ${(colour.channel_balance.g * 100).toFixed(0)}%  B ${(colour.channel_balance.b * 100).toFixed(0)}%` : '—'],
+    ['Media type', report.media_type_label || report.media_type || '—'],
     ['Metadata', `${meta.verdict || '—'}${meta.confidence ? ` (${meta.confidence})` : ''}`],
     ['C2PA', meta.c2pa?.present ? 'Present — unvalidated' : 'None found'],
     ['Generator', meta.ai_signatures?.length ? meta.ai_signatures.map((x) => x.label).join(', ') : 'None found'],

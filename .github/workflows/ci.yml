@@ -151,46 +151,76 @@ jobs:
           assert reconciled["verdict"] == "ai_generated", reconciled["verdict"]
           assert any(f["code"] == "metadata_overrides_verdict" for f in out2), out2
 
-          # --- anti-false-positive guardrails (deterministic, no model) ---
+          # --- three-tier classifier + deterministic overrides (no model) ---
+          from schemas import normalise_verdict, resolve_verdict, VERDICT_LABELS
+
+          assert normalise_verdict("Authentic Digital Art") == "authentic_digital_art"
+          assert normalise_verdict("AI Generated") == "ai_generated"
+          assert resolve_verdict("Authentic", "digital_art_illustration") == "authentic_digital_art"
+          assert resolve_verdict("Authentic", "photograph") == "authentic_photograph"
+          assert VERDICT_LABELS["inconclusive"] == "Inconclusive / Human Review Needed"
+
           CAM = {"verdict": "camera_capture_indicated", "ai_signatures": [], "editing_software": [],
                  "camera_evidence": {"present": True, "fields": {"ISO": "200", "ExposureTime": "1/320",
-                                                                 "FocalLength": "85", "FNumber": "2.8"}}, "c2pa": {}}
+                                                                 "FocalLength": "85", "Model": "EOS R6"}}, "c2pa": {}}
           NOMETA = {"verdict": "no_metadata", "ai_signatures": [], "editing_software": [],
                     "camera_evidence": {"present": False, "fields": {}}, "c2pa": {}}
           SD = {"verdict": "ai_generated",
                 "ai_signatures": [{"id": "sd", "label": "Stable Diffusion", "source": "metadata"}],
-                "editing_software": [],
-                "camera_evidence": {"present": True, "fields": {"ISO": "200"}}, "c2pa": {}}
+                "editing_software": [], "camera_evidence": {"present": True, "fields": {"ISO": "200"}}, "c2pa": {}}
+          C2PA_AI = {"verdict": "c2pa_claim_present", "ai_signatures": [], "editing_software": [],
+                     "camera_evidence": {"present": True, "fields": {"ISO": "100"}},
+                     "c2pa": {"present": True, "claim_generator": "Adobe Firefly 3.0"}}
 
-          def run(verdict, conf, meta):
+          def run(verdict, media, conf, meta, summary="x"):
               return prelint.lint_report({
-                  "verdict": verdict, "integrity_score": 50, "confidence": conf,
+                  "media_type": media, "verdict": verdict, "integrity_score": 50, "confidence": conf,
                   "tampering_detection": {"detected": False, "indicators": []},
                   "model_signature": {"likely_ai_generated": True, "suspected_model_family": None,
                                       "signature_evidence": []},
-                  "summary": "x"}, metadata=meta)
+                  "summary": summary}, metadata=meta)
 
-          # RULE B: organic capture EXIF outranks a visual AI call...
-          c, f = run("ai_generated", 88, CAM)
-          assert c["verdict"] == "authentic", c["verdict"]
-          assert any(x["code"] == "organic_exif_priority" for x in f), f
-          # ...but a hard generator manifest outranks the EXIF.
-          c, f = run("ai_generated", 88, SD)
-          assert c["verdict"] == "ai_generated", c["verdict"]
+          # RULE 1 — a human illustration must never be labelled as a photograph.
+          c, f = run("Authentic Photograph", "digital_art_illustration", 90, NOMETA)
+          assert c["verdict_key"] == "authentic_digital_art", c["verdict_key"]
+          assert any(x["code"] == "digital_art_sanitisation" for x in f), f
+          # ...including when the model omitted media_type but described art.
+          c, f = run("Authentic", None, 90, NOMETA, "Clean vector line art with flat shading.")
+          assert c["verdict_key"] == "authentic_digital_art", c["verdict_key"]
+          # ...and it must leave a genuine photograph alone.
+          c, f = run("Authentic", "photograph", 90, CAM)
+          assert c["verdict_key"] == "authentic_photograph", c["verdict_key"]
 
-          # RULE A: low confidence with nothing to corroborate it.
-          c, f = run("ai_generated", 60, NOMETA)
-          assert c["verdict"] == "authentic", c["verdict"]
-          assert any(x["code"] == "false_positive_guardrail_applied" for x in f), f
-          # The threshold is exclusive: 75 must survive.
-          c, f = run("ai_generated", 75, NOMETA)
-          assert c["verdict"] == "ai_generated", c["verdict"]
-          print("guardrails: Rule A and Rule B behave as specified")
+          # RULE 2 — low-confidence AI with nothing corroborating it.
+          c, f = run("AI Generated", "ai_synthetic", 70, NOMETA)
+          assert c["verdict_key"] == "inconclusive", c["verdict_key"]
+          assert c["integrity_score"] == 50, c["integrity_score"]
+          assert any(x["code"] == "low_confidence_fallback" for x in f), f
+          # The floor is exclusive: exactly 80 must survive.
+          c, f = run("AI Generated", "ai_synthetic", 80, NOMETA)
+          assert c["verdict_key"] == "ai_generated", c["verdict_key"]
 
-          # The strict prompt must keep its anti-false-positive clauses.
+          # RULE 3 — capture EXIF outranks a visual AI guess...
+          c, f = run("AI Generated", "ai_synthetic", 95, CAM)
+          assert c["verdict_key"] == "authentic_photograph", c["verdict_key"]
+          assert any(x["code"] == "exif_priority_guard" for x in f), f
+          # ...but yields to a generator manifest, and to a synthetic C2PA claim.
+          c, f = run("Authentic Photograph", "photograph", 95, SD)
+          assert c["verdict_key"] == "ai_generated", c["verdict_key"]
+          c, f = run("AI Generated", "ai_synthetic", 95, C2PA_AI)
+          assert c["verdict_key"] == "ai_generated", c["verdict_key"]
+
+          # An overridden verdict must not leave a contradictory summary.
+          c, f = run("Authentic Photograph", "photograph", 95, SD, "No AI indicators present.")
+          assert "Adjusted by PixelGuard" in c["summary"], c["summary"]
+          assert c["model_verdict_key"] == "authentic_photograph", c.get("model_verdict_key")
+          print("three-tier classifier: RULES 1-3 behave as specified")
+
+          # The prompt must retain its three-tier and anti-false-positive clauses.
           from services.gemini import FORENSICS_SYSTEM_PROMPT
-          for needle in ("CRITICAL ASSUMPTION", "ANTI-FALSE-POSITIVE MANDATE",
-                         "STRICT VERDICT THRESHOLDS", "portrait-mode", "pseudotext"):
+          for needle in ("digital_art_illustration", "ai_synthetic", "Authentic Digital Art",
+                         "Authentic Photograph", "must exceed 80", "clean vector lines",
+                         "Human digital illustration/artwork detected"):
               assert needle in FORENSICS_SYSTEM_PROMPT, needle
           print("strict prompt clauses present")
 
