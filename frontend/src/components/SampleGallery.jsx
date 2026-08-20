@@ -52,6 +52,10 @@ export default function SampleGallery({ onPick, disabled }) {
       if (!res.ok) throw new Error(`Sample unavailable (${res.status})`)
       const blob = await res.blob()
       onPick(new File([blob], sample.file, { type: blob.type }))
+      // Collapse once a sample is chosen: the picker has done its job, and
+      // leaving it open pushes the preview and Run button below the fold.
+      // Stays open on failure so the error is visible next to the card.
+      setOpen(false)
     } catch (err) {
       onPick(null, err.message)
     } finally {
