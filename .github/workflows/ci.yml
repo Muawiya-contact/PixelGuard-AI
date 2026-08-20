@@ -137,18 +137,22 @@ jobs:
           assert "ignore all previous" not in (safe or "").lower(), safe
           assert any(f["code"] == "override_attempt" for f in findings), findings
 
-          clean, out = prelint.lint_report({"verdict": "AI-Generated", "integrity_score": "142"})
+          clean, out = prelint.lint_report({"verdict": "AI Generated", "integrity_score": "142"})
           assert clean["integrity_score"] == 100
           assert any(f["code"] == "integrity_score_clamped" for f in out), out
 
-          meta_ev = {"ai_signatures": [{"id": "sd", "label": "Stable Diffusion", "source": "metadata"}], "editing_software": []}
+          # Reports carry both forms; assertions must use the key, never the
+          # display string.
+          meta_ev = {"ai_signatures": [{"id": "sd", "label": "Stable Diffusion", "source": "metadata"}],
+                     "editing_software": [], "camera_evidence": {"present": False, "fields": {}}, "c2pa": {}}
           reconciled, out2 = prelint.lint_report(
-              {"verdict": "authentic", "integrity_score": 95,
+              {"media_type": "photograph", "verdict": "Authentic Photograph", "integrity_score": 95,
                "tampering_detection": {"detected": False, "indicators": []},
                "model_signature": {"likely_ai_generated": False}, "summary": "ok"},
               metadata=meta_ev,
           )
-          assert reconciled["verdict"] == "ai_generated", reconciled["verdict"]
+          assert reconciled["verdict_key"] == "ai_generated", reconciled["verdict_key"]
+          assert reconciled["verdict"] == "AI Generated", reconciled["verdict"]
           assert any(f["code"] == "metadata_overrides_verdict" for f in out2), out2
 
           # --- three-tier classifier + deterministic overrides (no model) ---
