@@ -296,20 +296,39 @@ def lint_report(
                       f"Indicates processing, not necessarily deceptive manipulation.",
         })
 
+    camera = (metadata or {}).get("camera_evidence") or {}
+    camera_fields = set(camera.get("fields") or {})
+    # The spec's named fields, plus the tags Pillow actually surfaces.
+    physical_capture = bool(camera.get("present")) or bool(
+        camera_fields & {
+            "ISO", "ISOSpeedRatings", "ShutterSpeed", "ShutterSpeedValue",
+            "ExposureTime", "FocalLength", "CameraModel", "Model", "Make", "LensModel",
+        }
+    )
+
+    # Capture EXIF says "camera", the visual read says otherwise. Neither is
+    # necessarily wrong — EXIF is forgeable and a photo of a screen is still a
+    # photo — but silently picking one would hide the disagreement, which is the
+    # thing a reviewer most needs to see. Reported, never auto-resolved: the
+    # existing reconciliation rules remain the only things that move a verdict.
+    if (
+        physical_capture
+        and not hard_ai_manifest
+        and clean["media_type"] not in ("photograph", "unknown")
+    ):
+        named = ", ".join(sorted(camera_fields)[:4]) or "capture fields"
+        findings.append({
+            "stage": "evidence", "code": "exif_visual_media_conflict", "severity": "warning",
+            "detail": f"Metadata carries camera capture EXIF ({named}) but the visual read classified "
+                      f"this as '{clean['media_type']}'. The verdict is left as the model returned it; "
+                      f"EXIF is forgeable and this disagreement is for a reviewer to weigh.",
+        })
+
     # --- deterministic overrides (RULE 1-3) ------------------------------
     # Hard rules rather than prompt guidance, because a model cannot be relied
     # on to police itself — and because a reviewer needs to see exactly which
     # rule moved a verdict, so each one emits a finding.
     if GUARDRAILS_ENABLED:
-        camera = (metadata or {}).get("camera_evidence") or {}
-        camera_fields = set(camera.get("fields") or {})
-        # The spec's named fields, plus the tags Pillow actually surfaces.
-        physical_capture = bool(camera.get("present")) or bool(
-            camera_fields & {
-                "ISO", "ISOSpeedRatings", "ShutterSpeed", "ShutterSpeedValue",
-                "ExposureTime", "FocalLength", "CameraModel", "Model", "Make", "LensModel",
-            }
-        )
 
         # RULE 3 — organic capture EXIF outranks a visual AI guess. A camera
         # pipeline writes a coherent set of capture settings; a generator has no
