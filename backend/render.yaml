@@ -12,8 +12,14 @@ services:
     healthCheckPath: /api/v1/health
     autoDeploy: true
     envVars:
-      - key: PAID_GEMINI_API_KEY
-        sync: false # secret — set the value in the Render dashboard, never in git
+      # No Gemini key is declared on purpose. The analyze endpoints are
+      # unauthenticated, so a key on a public backend is a bill anyone can run
+      # up; the service is meant to run keyless and answer 503 for the
+      # model-backed routes. To run YOUR OWN keyed instance, add
+      # PAID_GEMINI_API_KEY (or GOOGLE_API_KEY) in the Render dashboard with
+      # sync: false — never a value in git. See docs/BRING-YOUR-OWN-KEY.md.
+      # - key: PAID_GEMINI_API_KEY
+      #   sync: false
       # Vercel origins (production + previews) are allowed by default via
       # CORS_ORIGIN_REGEX, so CORS_ORIGINS is only needed for other hosts.
       # Set it to "*" to allow every origin during demos/hackathon evaluation.

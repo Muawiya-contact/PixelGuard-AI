@@ -62,7 +62,14 @@ jobs:
 
           r = client.get("/api/v1/health")
           assert r.status_code == 200, r.status_code
-          print("GET /api/v1/health ->", r.json())
+          health = r.json()
+          # No key in CI, so the keyless contract must hold: the app is healthy,
+          # reports AI as off, and says why.
+          assert health["ai_enabled"] is False, health
+          assert health["status"] == "offline", health
+          assert health["api_key_present"] is False, health
+          assert "no Gemini API key" in health["ai_disabled_reason"], health
+          print("GET /api/v1/health ->", health)
 
           # Without an API key configured, analyze must fail closed with 503
           # rather than 500.
@@ -70,8 +77,26 @@ jobs:
               "/api/v1/forensics/analyze",
               files={"file": ("t.png", b"not-an-image", "image/png")},
           )
-          assert r.status_code in (400, 503), f"unexpected {r.status_code}: {r.text}"
+          assert r.status_code == 503, f"unexpected {r.status_code}: {r.text}"
+          assert "no Gemini API key" in r.json()["detail"], r.text
           print("POST /api/v1/forensics/analyze (no key) ->", r.status_code)
+
+          # The URL route must fail closed the same way, before any fetch.
+          r = client.post("/api/v1/analyze/url", json={"url": "https://example.com/x.jpg"})
+          assert r.status_code == 503, f"unexpected {r.status_code}: {r.text}"
+
+          # The offline pass keeps working with no key — that is the whole point
+          # of the keyless deployment.
+          import io
+          from PIL import Image
+
+          buf = io.BytesIO()
+          Image.new("RGB", (64, 64), (120, 30, 30)).save(buf, format="PNG")
+          r = client.post(
+              "/api/v1/analyze/local",
+              files={"file": ("t.png", buf.getvalue(), "image/png")},
+          )
+          assert r.status_code == 200, f"offline pass broke without a key: {r.text}"
 
           print("Backend endpoint checks passed")
           PY
