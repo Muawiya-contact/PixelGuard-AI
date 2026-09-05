@@ -3,7 +3,7 @@ import {
   ShieldCheck, ShieldAlert, ShieldQuestion, UploadCloud, ScanSearch, Loader2,
   ImageIcon, Fingerprint, Cpu, FileWarning, Activity, FileText, Layers,
   FileSearch, CheckCircle2, AlertTriangle, Info, X, RotateCcw, Hash,
-  Link2, ClipboardCopy, Check, Palette, Camera,
+  Link2, ClipboardCopy, Check, Palette, Camera, KeyRound,
 } from 'lucide-react'
 import CompareSlider from './components/CompareSlider.jsx'
 import SampleGallery from './components/SampleGallery.jsx'
@@ -12,6 +12,8 @@ import { useTheme } from './lib/theme.js'
 import { downloadCertificate } from './lib/certificate.js'
 
 const API_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+const BYOK_DOC_URL =
+  'https://github.com/Muawiya-contact/PixelGuard-AI/blob/main/docs/BRING-YOUR-OWN-KEY.md'
 
 // Status palettes carry both themes: a -300 tint that reads on near-black is
 // unreadable on white, so each role names its light and dark shade explicitly.
@@ -286,7 +288,36 @@ function PrelintPanel({ prelint }) {
   )
 }
 
-function AnalysisPanel({ loading, error, result, evidence }) {
+// The public deployment runs with no Gemini key on purpose — the analyze
+// endpoint is unauthenticated, so a key configured there is a bill anyone can
+// run up. Say that once, up front, so the missing verdict does not read as a
+// broken app.
+function KeylessBanner({ reason }) {
+  return (
+    <div className="panel mb-5 flex items-start gap-3 border-amber-600/30 bg-amber-500/10 p-4 dark:border-amber-500/30 dark:bg-amber-500/15">
+      <KeyRound size={16} className="mt-0.5 shrink-0 text-amber-700 dark:text-amber-300" />
+      <div className="min-w-0 text-sm">
+        <p className="font-medium text-amber-800 dark:text-amber-200">
+          AI analysis is not enabled on this deployment
+        </p>
+        <p className="mt-1 break-anywhere text-muted">
+          {reason ||
+            'No Gemini API key is configured here, so no model calls are made and nothing is billed.'}
+        </p>
+        <p className="mt-1 text-muted">
+          The offline evidence — metadata, hashes and the ELA heatmap — still runs in full. For the
+          model verdict, run PixelGuard locally with your own free key:{' '}
+          <a className="text-accent underline underline-offset-2" href={BYOK_DOC_URL} target="_blank" rel="noreferrer">
+            docs/BRING-YOUR-OWN-KEY.md
+          </a>
+          .
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function AnalysisPanel({ loading, error, result, evidence, aiDisabled }) {
   // Local evidence arrives in well under a second; only the model verdict waits.
   const shown = result || evidence
   if (loading && !shown) {
@@ -330,6 +361,9 @@ function AnalysisPanel({ loading, error, result, evidence }) {
 
   const report = result?.report || {}
   const modelPending = !result && loading
+  // Evidence without a model verdict, and none is coming: keyless deployment.
+  const modelOff = !result && !loading && aiDisabled
+  const noVerdict = modelPending || modelOff
   const verdict = VERDICT_STYLES[report.verdict_key] || VERDICT_STYLES.inconclusive
   // Prefer the backend's string so wording stays in one place.
   const verdictLabel = report.verdict || verdict.label
@@ -345,15 +379,24 @@ function AnalysisPanel({ loading, error, result, evidence }) {
     <div className="flex flex-col gap-4">
       <div className="panel flex flex-wrap items-center justify-between gap-3 p-5">
         <div className="flex min-w-0 items-center gap-4">
-          <div className={`shrink-0 rounded-xl border p-3 ${modelPending ? TONE.neutral : verdict.tone}`}>
-            {modelPending ? <Loader2 size={22} className="animate-spin" /> : <VerdictIcon size={22} />}
+          <div className={`shrink-0 rounded-xl border p-3 ${noVerdict ? TONE.neutral : verdict.tone}`}>
+            {modelPending ? <Loader2 size={22} className="animate-spin" />
+              : modelOff ? <KeyRound size={22} />
+              : <VerdictIcon size={22} />}
           </div>
           <div className="min-w-0">
             <p className="text-[10px] uppercase tracking-widest text-faint">Verdict</p>
             <p className="break-anywhere text-lg font-semibold text-fg">
-              {modelPending ? 'Awaiting model analysis…' : verdictLabel}
+              {modelPending ? 'Awaiting model analysis…'
+                : modelOff ? 'Offline evidence only'
+                : verdictLabel}
             </p>
-            {!modelPending && report.media_type && (
+            {modelOff && (
+              <p className="mt-1 break-anywhere text-xs text-muted">
+                No model verdict: AI analysis is not enabled on this deployment.
+              </p>
+            )}
+            {!noVerdict && report.media_type && (
               <p className="mt-1 flex items-center gap-1.5 text-xs text-muted">
                 <MediaIcon size={11} className="shrink-0" />
                 {report.media_type_label || media.label}
@@ -361,7 +404,7 @@ function AnalysisPanel({ loading, error, result, evidence }) {
             )}
           </div>
         </div>
-        {modelPending ? (
+        {noVerdict ? (
           <Badge className={TONE.neutral}>local evidence ready</Badge>
         ) : Number.isFinite(report.confidence) ? (
           <Badge className={TONE.neutral}>
@@ -370,7 +413,7 @@ function AnalysisPanel({ loading, error, result, evidence }) {
         ) : null}
       </div>
 
-      {!modelPending && (
+      {!noVerdict && (
       <div className="panel flex flex-col gap-6 p-5 sm:flex-row sm:items-center">
         {score !== null && <ScoreRing score={score} />}
         <div className="flex min-w-0 flex-1 flex-col gap-3">
@@ -450,6 +493,23 @@ export default function App() {
   const [urlInput, setUrlInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [copied, setCopied] = useState(false)
+  // null until /health answers: the banner and the button label must not flash
+  // the wrong state on a slow (or sleeping free-tier) backend.
+  const [ai, setAi] = useState({ enabled: null, reason: null })
+
+  useEffect(() => {
+    let live = true
+    fetch(`${API_URL}/api/v1/health`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!live || !d) return
+        setAi({ enabled: Boolean(d.ai_enabled), reason: d.ai_disabled_reason || null })
+      })
+      .catch(() => {}) // unreachable backend is reported by the analysis path
+    return () => { live = false }
+  }, [])
+
+  const aiDisabled = ai.enabled === false
 
   // Object URLs are revoked when replaced or cleared (below) but deliberately
   // NOT on unmount: React Fast Refresh and StrictMode both remount components
@@ -506,6 +566,17 @@ export default function App() {
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => { if (d) setEvidence(d) })
       .catch(() => {}) // best-effort: the full pass is the one that must succeed
+
+    // Keyless deployment: run the offline pass alone rather than firing a
+    // request that can only come back 503.
+    if (aiDisabled) {
+      try {
+        await localCall
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
 
     const fullBody = body()
     if (prompt.trim()) fullBody.append('prompt', prompt.trim())
@@ -577,10 +648,25 @@ export default function App() {
   }
 
   const handleDownload = async () => {
-    if (certifying || !result) return
+    const payload = result || (aiDisabled && evidence
+      // Certify what actually ran. Without this the generator would fall back
+      // to its "inconclusive" label, which reads as a model verdict that was
+      // never produced.
+      ? {
+          ...evidence,
+          report: {
+            verdict: 'Offline evidence only — no model verdict',
+            verdict_key: 'inconclusive',
+            summary:
+              'AI analysis was not enabled on this deployment, so no model verdict was produced. '
+              + 'This certificate covers the offline evidence only: hashes, metadata and ELA.',
+          },
+        }
+      : null)
+    if (certifying || !payload) return
     setCertifying(true)
     try {
-      await downloadCertificate(result, file)
+      await downloadCertificate(payload, file)
     } catch (err) {
       setError(`Could not generate certificate: ${err.message}`)
     } finally {
@@ -617,9 +703,9 @@ export default function App() {
         <div className="flex min-w-0 flex-wrap items-center gap-1.5 rounded-xl border border-line bg-card p-1.5">
           <span
             className="hidden max-w-[150px] truncate px-2 font-mono text-[11px] text-faint sm:inline"
-            title={result?.model || 'gemini-flash-latest'}
+            title={result?.model || (aiDisabled ? 'AI analysis not enabled on this deployment' : 'gemini-flash-latest')}
           >
-            {result?.model || 'gemini-flash-latest'}
+            {result?.model || (aiDisabled ? 'model offline' : 'gemini-flash-latest')}
           </span>
           <button onClick={copyPayload} disabled={!result && !evidence} className={controlBtn} title="Copy the analysis payload as JSON">
             {copied ? <Check size={13} /> : <ClipboardCopy size={13} />}
@@ -628,13 +714,15 @@ export default function App() {
           <button onClick={handleClear} disabled={!file || loading} className={controlBtn} title="Clear the selected image">
             <RotateCcw size={13} /> <span className="hidden sm:inline">Reset</span>
           </button>
-          <button onClick={handleDownload} disabled={!result || certifying} className={controlBtn} title="Download the forensic certificate as PDF">
+          <button onClick={handleDownload} disabled={(!result && !(aiDisabled && evidence)) || certifying} className={controlBtn} title="Download the forensic certificate as PDF">
             {certifying ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
             <span className="hidden sm:inline">{certifying ? 'Building…' : 'Export'}</span>
           </button>
           <ThemeToggle isDark={isDark} onToggle={toggle} />
         </div>
       </header>
+
+      {aiDisabled && <KeylessBanner reason={ai.reason} />}
 
       <main className="grid min-w-0 gap-5 lg:grid-cols-2">
         <section className="flex min-w-0 flex-col gap-4">
@@ -679,7 +767,9 @@ export default function App() {
             disabled={!file || loading}
             className="flex items-center justify-center gap-2 rounded-2xl bg-accent px-6 py-3.5 font-semibold text-accent-on transition-all hover:brightness-110 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {loading ? (<><Loader2 size={18} className="animate-spin" /> Analyzing…</>) : (<><ScanSearch size={18} /> Run Forensics</>)}
+            {loading ? (<><Loader2 size={18} className="animate-spin" /> Analyzing…</>)
+              : aiDisabled ? (<><ScanSearch size={18} /> Run Offline Forensics</>)
+              : (<><ScanSearch size={18} /> Run Forensics</>)}
           </button>
 
           {(result?.ela || evidence?.ela)?.heatmap && previewUrl && (
@@ -698,7 +788,7 @@ export default function App() {
           <div className="flex items-center gap-2 text-sm font-medium text-muted">
             <Fingerprint size={16} className="text-accent" /> Forensic Report
           </div>
-          <AnalysisPanel loading={loading} error={error} result={result} evidence={evidence} />
+          <AnalysisPanel loading={loading} error={error} result={result} evidence={evidence} aiDisabled={aiDisabled} />
         </section>
       </main>
 

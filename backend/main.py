@@ -31,6 +31,28 @@ load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("PAID_GEMINI_API_KEY")
 KEY_MODE = os.getenv("GEMINI_KEY_MODE", "developer").strip().lower()
 
+# The public deployment ships with NO key on purpose: the analyze endpoints are
+# unauthenticated, so a key configured there is a bill anyone can run up. With
+# no key the model calls are simply switched off and every request costs zero.
+# PIXELGUARD_DISABLE_AI=1 forces the same behaviour even when a key is present.
+DISABLE_AI = os.getenv("PIXELGUARD_DISABLE_AI", "").strip().lower() in {"1", "true", "yes", "on"}
+AI_ENABLED = bool(API_KEY) and not DISABLE_AI
+
+# One message, used by /health and by every endpoint that needs the model, so
+# the UI and the API never disagree about why the verdict is missing.
+AI_DISABLED_DETAIL = (
+    "AI analysis is not enabled on this deployment — no Gemini API key is "
+    "configured, so no model calls are made and nothing is billed. The offline "
+    "evidence (metadata, hashes, ELA) still runs. To get the model verdict, run "
+    "PixelGuard locally with your own free key: see docs/BRING-YOUR-OWN-KEY.md."
+)
+
+
+def require_ai() -> None:
+    """Reject model-backed requests when this deployment has no key."""
+    if not AI_ENABLED:
+        raise HTTPException(status_code=503, detail=AI_DISABLED_DETAIL)
+
 # "-latest" aliases track Google's current models and never go stale.
 # Flash is the default: measured against the real forensic prompt it returns in
 # ~5.0s versus ~13.2s for pro on the same downscaled input, and the reports are
@@ -59,8 +81,8 @@ _client: genai.Client | None = None
 def get_client() -> genai.Client:
     global _client
     if _client is None:
-        if not API_KEY:
-            raise RuntimeError("No API key configured")
+        if not AI_ENABLED:
+            raise RuntimeError(AI_DISABLED_DETAIL)
         if KEY_MODE == "vertex":
             _client = genai.Client(vertexai=True, api_key=API_KEY)
         else:
@@ -108,16 +130,22 @@ def root():
 def health():
     api_key_present = bool(API_KEY)
     client_ok = False
-    detail = "No API key found — set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env"
-    if api_key_present:
+    detail = AI_DISABLED_DETAIL
+    if AI_ENABLED:
         try:
             get_client()
             client_ok = True
             detail = f"Client ready in {KEY_MODE} mode"
         except Exception as exc:  # pragma: no cover
             detail = redact(f"Client initialization failed: {exc}")
+    elif api_key_present:
+        detail = "AI analysis is switched off by PIXELGUARD_DISABLE_AI."
     return {
-        "status": "ok" if (api_key_present and client_ok) else "degraded",
+        # "offline" is a healthy state, not a failure: the deployment is meant
+        # to run keyless. "degraded" is reserved for a key that will not start.
+        "status": "ok" if client_ok else ("degraded" if AI_ENABLED else "offline"),
+        "ai_enabled": client_ok,
+        "ai_disabled_reason": None if client_ok else detail,
         "api_key_present": api_key_present,
         "key_mode": KEY_MODE if api_key_present else None,
         "model": PREFERRED_MODEL,
@@ -423,11 +451,7 @@ async def analyze_url(payload: UrlRequest):
     Same SSRF guards as /fetch-url, plus a JPEG/PNG/WebP allowlist and a 10 MB
     cap. The bytes go straight into the pipeline — nothing is written to disk.
     """
-    if not API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="No API key configured. Set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env.",
-        )
+    require_ai()
     try:
         raw, content_type, final_url = await fetch_url_service.fetch_image_async(payload.url)
     except fetch_url_service.FetchError as exc:
@@ -459,11 +483,7 @@ async def analyze_image(
     include_ela: bool = Form(True),
 ):
     """Full forensic pass on an uploaded file."""
-    if not API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="No API key configured. Set GOOGLE_API_KEY or PAID_GEMINI_API_KEY in backend/.env.",
-        )
+    require_ai()
     image, raw = await _read_image(file)
     return await _run_pipeline(
         image, raw, file.filename, file.content_type, prompt, include_ela

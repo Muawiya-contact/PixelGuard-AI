@@ -23,6 +23,14 @@ A [sample forensic certificate](docs/sample-forensic-certificate.pdf) exported d
 
 The demo runs two real investigations. First, a photorealistic Gemini-generated image: the vision model flags structural artefacts (garbled pseudotext, incoherent hardware) at 83% confidence while the metadata parser independently finds Google's SynthID provenance marker — two evidence paths reaching the same verdict, **AI Generated**. Then a real photograph with its metadata stripped in transit: **Authentic Photograph**. A tool that only ever says "fake" is useless — clearing real images matters as much as catching synthetic ones. When evidence paths disagree, prelint reports the conflict as a named finding instead of silently picking a side.
 
+> **The hosted demo runs without a Gemini API key.** The analyze endpoint is
+> unauthenticated, so a key configured there would be a bill anyone could run
+> up — the public deployment therefore makes no model calls and costs nothing.
+> The offline evidence (metadata, hashes, ELA heatmap) still runs in full; the
+> model verdict is replaced by a banner explaining why. To see the complete
+> pipeline, run it locally with your own free key — 5 minutes, see
+> **[docs/BRING-YOUR-OWN-KEY.md](docs/BRING-YOUR-OWN-KEY.md)**.
+
 > The backend runs on Render's free tier, which sleeps after ~15 minutes idle. **The first request can take ~23 seconds**; every request after that is ~8 seconds. Hit the health endpoint once to wake it before demoing.
 
 ## Architecture
@@ -49,7 +57,7 @@ cp .env.example .env   # then paste your Gemini API key into .env
 uvicorn main:app --reload --port 8000
 ```
 
-Get a free Gemini API key at https://aistudio.google.com/apikey.
+Get a free Gemini API key at https://aistudio.google.com/apikey. Full walkthrough, including how to confirm the key was picked up: [docs/BRING-YOUR-OWN-KEY.md](docs/BRING-YOUR-OWN-KEY.md). Without a key the app still starts and runs every offline check — only the model verdict is withheld.
 
 Verify: http://localhost:8000 → `{"message": "PixelGuard Backend API Active"}`
 Health: http://localhost:8000/api/v1/health
@@ -76,7 +84,7 @@ The frontend adds a draggable **original vs. ELA heatmap** comparison slider, a 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/` | Liveness check |
-| GET | `/api/v1/health` | API key, model and CORS configuration status |
+| GET | `/api/v1/health` | Whether AI analysis is enabled (`ai_enabled`, `ai_disabled_reason`), plus model and CORS status |
 | POST | `/api/v1/forensics/analyze` | Full pass: metadata + ELA + model analysis + verification |
 | POST | `/api/v1/analyze/ela` | Error Level Analysis heatmap (local, no API key needed) |
 | POST | `/api/v1/analyze/metadata` | C2PA / EXIF / XMP parse (local, no API key needed) |
@@ -179,11 +187,12 @@ Deploy the backend first (you need its URL for the frontend), then the frontend,
    - **Language / Runtime:** Docker
    - **Root Directory:** `backend`
    - **Instance Type:** Free
-4. Under **Environment Variables**, add:
-   - `PAID_GEMINI_API_KEY` = your Gemini API key (paste it in the dashboard — it is a secret and never belongs in git). `GOOGLE_API_KEY` works too.
+4. Under **Environment Variables**:
+   - **Add no Gemini key** unless you accept the bill. The analyze endpoint is unauthenticated, so a key here is quota anyone who finds the URL can spend. Keyless, the service runs for free and answers `503` on the model-backed routes with an explanation the UI renders as a banner.
+   - If you do want a keyed instance, add `PAID_GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in the dashboard — a secret, never in git — and set a spending cap on the Google Cloud project first.
    - `CORS_ORIGINS` = leave empty for now; you'll set it in Step 3.
 5. Click **Deploy Web Service**. When the build finishes, note your backend URL, e.g. `https://pixelguard-backend.onrender.com`.
-6. Verify: open `https://<your-backend>.onrender.com/api/v1/health` — it should report `"status": "ok"`.
+6. Verify: open `https://<your-backend>.onrender.com/api/v1/health` — `"status": "offline"` with `"ai_enabled": false` is the expected keyless result; `"status": "ok"` means a key is configured and live.
 
 Every push to `main` now redeploys the backend automatically.
 
@@ -198,6 +207,7 @@ Every push to `main` now redeploys the backend automatically.
    - **Root Directory:** `frontend` (Vercel then auto-detects Vite; build `npm run build`, output `dist`)
 3. Under **Environment Variables**, add:
    - `VITE_API_BASE_URL` = your Render backend URL from Step 1 (no trailing slash), e.g. `https://pixelguard-backend.onrender.com`
+   - **Nothing else.** No Gemini key belongs on Vercel — Vite inlines every `VITE_*` variable into the public JavaScript bundle. If one was ever set there, delete it, redeploy, and revoke the key. See [docs/BRING-YOUR-OWN-KEY.md](docs/BRING-YOUR-OWN-KEY.md#removing-the-key-from-a-live-deployment).
 4. Click **Deploy**. Note your production domain, e.g. `https://pixelguard.vercel.app`.
 
 `frontend/vercel.json` rewrites all routes to `index.html` (SPA routing). Every push to `main` redeploys; PRs get preview URLs.
@@ -255,7 +265,9 @@ The key is a server-side secret. It is read from the environment at startup and 
 
 ### Known exposure: the analyze endpoint is public
 
-`POST /api/v1/forensics/analyze` requires no authentication, so anyone who discovers your Render URL can submit images and **spend your Gemini quota**. The key itself stays safe; the billing does not. This is a reasonable trade for a public demo, but before leaving it up long-term consider:
+`POST /api/v1/forensics/analyze` requires no authentication, so anyone who discovers your Render URL can submit images and **spend your Gemini quota**. The key itself stays safe; the billing does not.
+
+**This deployment's answer is to run keyless.** No key is set on the hosted backend, so the model is never called and the exposure is zero; the model-backed routes return `503` and the frontend explains it. `PIXELGUARD_DISABLE_AI=1` produces the same behaviour without removing a configured key. If you do run a keyed public instance, consider:
 
 - setting a spending cap or quota limit on the Google Cloud project,
 - restricting the API key to the Generative Language API in the Google Cloud console,
@@ -272,6 +284,7 @@ Disabling the public API explorer also lowers discoverability: pass `docs_url=No
 | `PAID_GEMINI_API_KEY` | backend | Alternative name for the key, e.g. paid `AQ.…` keys |
 | `GEMINI_MODEL` | backend | Optional model override (default `gemini-pro-latest`, auto-fallback) |
 | `GEMINI_KEY_MODE` | backend | `developer` (default) or `vertex` for Vertex AI express keys |
+| `PIXELGUARD_DISABLE_AI` | backend | `1` switches the model off even when a key is set (no calls, no billing) |
 | `CORS_ORIGINS` | backend | Extra allowed origins, comma-separated; `*` allows all (localhost always allowed) |
 | `CORS_ORIGIN_REGEX` | backend | Origin pattern, default `https://[a-z0-9-]+\.vercel\.app` (covers preview deploys) |
 | `VITE_API_BASE_URL` | frontend | Backend base URL (defaults to `http://localhost:8000`) |
